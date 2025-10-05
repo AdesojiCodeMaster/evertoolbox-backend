@@ -80,6 +80,11 @@ import * as cheerio from "cheerio";
 
 const app = express();
 
+app.get("/", (req, res) => {
+  res.send("Backend is running ✅");
+});
+
+// SEO Analyzer route
 app.get("/api/seo-analyze", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: "Missing url" });
@@ -103,5 +108,6 @@ app.get("/api/seo-analyze", async (req, res) => {
   }
 });
 
-export default app;
-  
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+        
