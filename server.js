@@ -97,6 +97,8 @@ app.post('/api/tts', express.json(), async (req, res) => {
   } catch (err) {
     console.error('TTS failed', err);
     return res.status(500).json({ error: 'TTS generation failed' });
+    console.log("TTS requested:", { text, lang });
+
   }
 });
 
