@@ -69,3 +69,39 @@ app.get("/", (req, res) => {
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
         
+
+
+
+//FOR SEO ANALYZER 
+
+import express from "express";
+import fetch from "node-fetch";
+import * as cheerio from "cheerio";
+
+const app = express();
+
+app.get("/api/seo-analyze", async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ error: "Missing url" });
+
+  try {
+    const resp = await fetch(url);
+    const html = await resp.text();
+    const $ = cheerio.load(html);
+
+    const title = $("title").text() || "";
+    const description = $('meta[name="description"]').attr("content") || "";
+
+    const issues = [];
+    if (title.length < 30 || title.length > 65) issues.push("Title length should be 30–65 characters.");
+    if (description.length < 70 || description.length > 160) issues.push("Meta description should be 70–160 characters.");
+
+    res.json({ title, description, issues });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to fetch page." });
+  }
+});
+
+export default app;
+  
