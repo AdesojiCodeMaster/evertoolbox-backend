@@ -80,27 +80,72 @@ app.get('/api/seo-analyze', async (req, res) => {
 // POST /api/tts  body: { text: "...", lang: "en" }
 // returns audio/mpeg (MP3)
 // --------------------
-app.post('/api/tts', express.json(), async (req, res) => {
-  try {
-    const text = (req.body && req.body.text) ? String(req.body.text) : '';
-    const lang = (req.body && req.body.lang) ? String(req.body.lang) : 'en';
-    if (!text || text.trim().length === 0) return res.status(400).json({ error: 'Missing text in request body' });
-    // limit text length for safety
-    if (text.length > 5000) return res.status(400).json({ error: 'Text too long (limit 5000 chars)' });
+// --- Patched /api/tts endpoint ---
+// Supports auto language detection and explicit language use.
 
-    // google-tts-api: getAudioBase64
-    const base64 = await googleTTS.getAudioBase64(text, { lang, slow: false, host: 'https://translate.google.com' });
+const franc = require('franc'); // npm i franc
+
+// Mapping franc 3-letter codes to Google TTS-compatible BCP47 codes
+const LANG_MAP = {
+  eng: 'en',
+  spa: 'es',
+  fra: 'fr',
+  deu: 'de',
+  ita: 'it',
+  por: 'pt',
+  rus: 'ru',
+  hin: 'hi',
+  ara: 'ar',
+  cmn: 'zh-CN',
+  jpn: 'ja-JP',
+  kor: 'ko-KR',
+};
+
+function mapFrancToLang(francCode) {
+  if (!francCode || francCode === 'und') return 'en';
+  return LANG_MAP[francCode] || francCode.slice(0, 2);
+}
+
+app.post('/api/tts', async (req, res) => {
+  try {
+    const { text, lang = 'auto', slow = false, asBase64 = false } = req.body || {};
+
+    if (!text || typeof text !== 'string' || !text.trim()) {
+      return res.status(400).json({ error: 'Missing text' });
+    }
+    if (text.length > 5000) {
+      return res.status(400).json({ error: 'Text too long (max 5000 chars)' });
+    }
+
+    // Detect language if auto
+    let useLang = lang;
+    if (lang === 'auto' || !lang) {
+      const guess = franc(text.trim().slice(0, 400), { minLength: 10 });
+      useLang = mapFrancToLang(guess);
+      console.log(`Detected language: ${guess} → ${useLang}`);
+    }
+
+    const base64 = await googleTTS.getAudioBase64(text, {
+      lang: useLang,
+      slow: Boolean(slow),
+      host: 'https://translate.google.com',
+    });
+
+    if (asBase64) {
+      return res.json({ lang: useLang, base64 });
+    }
+
     const buffer = Buffer.from(base64, 'base64');
     res.setHeader('Content-Type', 'audio/mpeg');
     res.setHeader('Content-Disposition', 'attachment; filename="speech.mp3"');
-    return res.send(buffer);
+    res.send(buffer);
   } catch (err) {
-    console.error('TTS failed', err);
-    return res.status(500).json({ error: 'TTS generation failed' });
-    console.log("TTS requested:", { text, lang });
-
+    console.error('TTS error:', err);
+    res.status(500).json({ error: 'TTS generation failed', detail: err.message });
   }
 });
+// --- End patched /api/tts endpoint ---
+
 
 // --------------------
 // 3) Document conversion (uses LibreOffice 'soffice')
