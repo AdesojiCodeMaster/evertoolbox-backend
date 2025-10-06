@@ -84,7 +84,7 @@ app.get('/api/seo-analyze', async (req, res) => {
 // --- TTS endpoint with translation + speech ---
 // Place this near other routes in your server.js
 
-const fetch = require('node-fetch');   // already available in most Node 18+ environments
+
 const { franc } = require('franc');
 const googleTTS = require('google-tts-api');
 
