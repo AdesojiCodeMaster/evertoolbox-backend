@@ -87,47 +87,73 @@ app.get('/api/seo-analyze', async (req, res) => {
 
 const { franc } = require('franc');
 //const googleTTS = require('google-tts-api');
-app.post('/api/tts', async (req, res) => {
+// Hybrid OpenAI + Google fallback TTS
+app.post("/api/tts", async (req, res) => {
   try {
     const { text, lang } = req.body;
-    if (!text || !lang) {
-      return res.status(400).json({ error: 'Missing text or lang' });
+    if (!text) return res.status(400).json({ error: "Missing text" });
+
+    const language = lang || "en";
+
+    // --- 1️⃣ Try OpenAI TTS ---
+    try {
+      const aiResp = await fetch("https://api.openai.com/v1/audio/speech", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-mini-tts",
+          input: text,
+          voice: "alloy",
+          format: "mp3",
+        }),
+      });
+
+      if (aiResp.ok) {
+        res.setHeader("Content-Type", "audio/mpeg");
+        aiResp.body.pipe(res);
+        return;
+      } else {
+        const errText = await aiResp.text();
+        console.warn("OpenAI TTS failed:", errText);
+      }
+    } catch (err) {
+      console.warn("OpenAI TTS error:", err.message);
     }
 
-    // Step 1: Translate text to target language using Google Translate endpoint
-    const translateUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(lang)}&dt=t&q=${encodeURIComponent(text)}`;
-    const translateResp = await fetch(translateUrl);
-    const translateData = await translateResp.json();
+    // --- 2️⃣ Fallback to Google TTS ---
+    console.log(`Falling back to Google TTS for ${language}`);
+    const googleTTS = require("google-tts-api");
 
-    const translatedText = translateData[0]?.map(x => x[0]).join(' ');
-    if (!translatedText) {
-      return res.status(500).json({ error: 'Translation failed' });
+    let url;
+    try {
+      url = googleTTS.getAudioUrl(text, {
+        lang: language,
+        slow: false,
+        host: "https://translate.google.com",
+      });
+    } catch (e) {
+      console.warn(`Google TTS doesn’t support ${language}, defaulting to English`);
+      url = googleTTS.getAudioUrl(text, {
+        lang: "en",
+        slow: false,
+        host: "https://translate.google.com",
+      });
     }
 
-    console.log(`Translated to [${lang}]:`, translatedText);
-
-    // Step 2: Generate TTS from translated text
-    const googleTTS = await import('google-tts-api');
-    const url = googleTTS.getAudioUrl(translatedText, {
-      lang,
-      slow: false,
-      host: 'https://translate.google.com',
-    });
-
-    // Step 3: Fetch MP3 and send it back
+    // Stream Google TTS result
     const audioResp = await fetch(url);
-    const audioBuf = await audioResp.arrayBuffer();
-
-    res.set({
-      'Content-Type': 'audio/mpeg',
-      'Content-Disposition': 'attachment; filename="speech.mp3"',
-    });
-    res.send(Buffer.from(audioBuf));
+    if (!audioResp.ok) throw new Error("Google TTS fetch failed");
+    res.setHeader("Content-Type", "audio/mpeg");
+    audioResp.body.pipe(res);
   } catch (err) {
-    console.error('TTS error:', err);
-    res.status(500).json({ error: 'TTS generation failed' });
+    console.error("Hybrid TTS error:", err);
+    res.status(500).json({ error: err.message || "TTS service failed" });
   }
 });
+                   
     
     
 
