@@ -86,7 +86,7 @@ app.get('/api/seo-analyze', async (req, res) => {
 
 
 const { franc } = require('franc');
-const googleTTS = require('google-tts-api');
+//const googleTTS = require('google-tts-api');
 
 app.post('/api/tts', async (req, res) => {
   try {
