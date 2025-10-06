@@ -80,71 +80,66 @@ app.get('/api/seo-analyze', async (req, res) => {
 // POST /api/tts  body: { text: "...", lang: "en" }
 // returns audio/mpeg (MP3)
 // --------------------
-// --- Patched /api/tts endpoint ---
-// Supports auto language detection and explicit language use.
 
-const franc = require('franc'); // npm i franc
+// --- TTS endpoint with translation + speech ---
+// Place this near other routes in your server.js
 
-// Mapping franc 3-letter codes to Google TTS-compatible BCP47 codes
-const LANG_MAP = {
-  eng: 'en',
-  spa: 'es',
-  fra: 'fr',
-  deu: 'de',
-  ita: 'it',
-  por: 'pt',
-  rus: 'ru',
-  hin: 'hi',
-  ara: 'ar',
-  cmn: 'zh-CN',
-  jpn: 'ja-JP',
-  kor: 'ko-KR',
-};
-
-function mapFrancToLang(francCode) {
-  if (!francCode || francCode === 'und') return 'en';
-  return LANG_MAP[francCode] || francCode.slice(0, 2);
-}
+const fetch = require('node-fetch');   // already available in most Node 18+ environments
+const { franc } = require('franc');
+const googleTTS = require('google-tts-api');
 
 app.post('/api/tts', async (req, res) => {
   try {
-    const { text, lang = 'auto', slow = false, asBase64 = false } = req.body || {};
+    const { text, lang } = req.body || {};
+    if (!text) return res.status(400).json({ error: 'Missing text' });
 
-    if (!text || typeof text !== 'string' || !text.trim()) {
-      return res.status(400).json({ error: 'Missing text' });
-    }
-    if (text.length > 5000) {
-      return res.status(400).json({ error: 'Text too long (max 5000 chars)' });
-    }
+    // Target language (from user selection)
+    const targetLang = (lang || 'en').split('-')[0].toLowerCase();
 
-    // Detect language if auto
-    let useLang = lang;
-    if (lang === 'auto' || !lang) {
-      const guess = franc(text.trim().slice(0, 400), { minLength: 10 });
-      useLang = mapFrancToLang(guess);
-      console.log(`Detected language: ${guess} → ${useLang}`);
-    }
+    // Detect source language
+    const detected = franc(text);
+    const sourceLang = detected && detected !== 'und' ? detected : 'auto';
 
-    const base64 = await googleTTS.getAudioBase64(text, {
-      lang: useLang,
-      slow: Boolean(slow),
+    console.log(`Translating from ${sourceLang} → ${targetLang}`);
+
+    // 1️⃣ Translate text
+    // Use Google Translate free endpoint
+    const transURL = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sourceLang}&tl=${targetLang}&dt=t&q=${encodeURIComponent(
+      text
+    )}`;
+    const transResp = await fetch(transURL);
+    const transJson = await transResp.json();
+
+    // Extract translated text
+    const translated =
+      (transJson && transJson[0] && transJson[0].map((t) => t[0]).join('')) ||
+      text;
+
+    console.log('Translated text:', translated);
+
+    // 2️⃣ Generate speech
+    const ttsUrl = googleTTS.getAudioUrl(translated, {
+      lang: targetLang,
+      slow: false,
       host: 'https://translate.google.com',
     });
 
-    if (asBase64) {
-      return res.json({ lang: useLang, base64 });
-    }
+    // 3️⃣ Fetch the MP3 and send as download
+    const audioResp = await fetch(ttsUrl);
+    const arrayBuffer = await audioResp.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
 
-    const buffer = Buffer.from(base64, 'base64');
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Content-Disposition', 'attachment; filename="speech.mp3"');
+    res.set({
+      'Content-Type': 'audio/mpeg',
+      'Content-Disposition': 'attachment; filename="speech.mp3"',
+    });
     res.send(buffer);
   } catch (err) {
     console.error('TTS error:', err);
-    res.status(500).json({ error: 'TTS generation failed', detail: err.message });
+    res.status(500).json({ error: 'TTS failed: ' + err.message });
   }
 });
-// --- End patched /api/tts endpoint ---
+  
 
 
 // --------------------
