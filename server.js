@@ -87,64 +87,48 @@ app.get('/api/seo-analyze', async (req, res) => {
 
 const { franc } = require('franc');
 //const googleTTS = require('google-tts-api');
-// --- Text-to-Speech route ---
 app.post('/api/tts', async (req, res) => {
   try {
     const { text, lang } = req.body;
     if (!text || !lang) {
-      return res.status(400).json({ error: 'Missing text or language' });
+      return res.status(400).json({ error: 'Missing text or lang' });
     }
 
-    const cleanText = text.trim();
+    // Step 1: Translate text to target language using Google Translate endpoint
+    const translateUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(lang)}&dt=t&q=${encodeURIComponent(text)}`;
+    const translateResp = await fetch(translateUrl);
+    const translateData = await translateResp.json();
 
-    // Use Google Translate TTS (public endpoint)
-    // If Google TTS doesn't support the requested language,
-    // it will fall back to translating the text to that language first.
-    const ttsUrl = `https://translate.googleapis.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(
-      cleanText
-    )}&tl=${encodeURIComponent(lang)}&client=tw-ob`;
-
-    const response = await fetch(ttsUrl);
-
-    // If we get HTML instead of audio, Google probably didn’t support the language.
-    const contentType = response.headers.get('content-type') || '';
-    if (!contentType.includes('audio')) {
-      console.warn(`[TTS Fallback] ${lang} not supported directly, using translation fallback`);
-
-      // 1️⃣ Translate text to target language first
-      const transUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(
-        lang
-      )}&dt=t&q=${encodeURIComponent(cleanText)}`;
-      const transResp = await fetch(transUrl);
-      const transJson = await transResp.json();
-
-      // Extract translated text safely
-      const translatedText =
-        transJson?.[0]?.map((seg) => seg[0]).join(' ') || cleanText;
-
-      // 2️⃣ Generate TTS from the translated text
-      const fallbackUrl = `https://translate.googleapis.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(
-        translatedText
-      )}&tl=${encodeURIComponent(lang)}&client=tw-ob`;
-
-      const fallbackResp = await fetch(fallbackUrl);
-      const audioBuffer = await fallbackResp.arrayBuffer();
-
-      res.setHeader('Content-Type', 'audio/mpeg');
-      res.setHeader('Content-Disposition', 'inline; filename="tts.mp3"');
-      return res.send(Buffer.from(audioBuffer));
+    const translatedText = translateData[0]?.map(x => x[0]).join(' ');
+    if (!translatedText) {
+      return res.status(500).json({ error: 'Translation failed' });
     }
 
-    // ✅ Primary TTS works
-    const audioBuffer = await response.arrayBuffer();
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Content-Disposition', 'inline; filename="tts.mp3"');
-    res.send(Buffer.from(audioBuffer));
+    console.log(`Translated to [${lang}]:`, translatedText);
+
+    // Step 2: Generate TTS from translated text
+    const googleTTS = await import('google-tts-api');
+    const url = googleTTS.getAudioUrl(translatedText, {
+      lang,
+      slow: false,
+      host: 'https://translate.google.com',
+    });
+
+    // Step 3: Fetch MP3 and send it back
+    const audioResp = await fetch(url);
+    const audioBuf = await audioResp.arrayBuffer();
+
+    res.set({
+      'Content-Type': 'audio/mpeg',
+      'Content-Disposition': 'attachment; filename="speech.mp3"',
+    });
+    res.send(Buffer.from(audioBuf));
   } catch (err) {
     console.error('TTS error:', err);
-    res.status(500).json({ error: 'TTS failed', details: err.message });
+    res.status(500).json({ error: 'TTS generation failed' });
   }
 });
+    
     
 
 
