@@ -87,25 +87,53 @@ app.get('/api/seo-analyze', async (req, res) => {
 
 const { franc } = require('franc');
 //const googleTTS = require('google-tts-api');
-// Hybrid OpenAI + Google fallback TTS
+// TTS with translation + hybrid OpenAI + Google fallback
 app.post("/api/tts", async (req, res) => {
   try {
     const { text, lang } = req.body;
     if (!text) return res.status(400).json({ error: "Missing text" });
+    const targetLang = lang || "en";
 
-    const language = lang || "en";
+    let translatedText = text;
 
-    // --- 1️⃣ Try OpenAI TTS ---
+    // --- 1️⃣ Translate text into target language ---
     try {
-      const aiResp = await fetch("https://api.openai.com/v1/audio/speech", {
+      const translationResp = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
         headers: {
           "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
+          model: "gpt-4o-mini",
+          messages: [
+            {
+              role: "system",
+              content: `Translate the following text into ${targetLang}. Return only the translated text.`,
+            },
+            { role: "user", content: text },
+          ],
+        }),
+      });
+
+      const translationData = await translationResp.json();
+      translatedText =
+        translationData?.choices?.[0]?.message?.content?.trim() || text;
+    } catch (e) {
+      console.warn("Translation failed, using original text:", e.message);
+    }
+
+    // --- 2️⃣ Try OpenAI TTS on translated text ---
+    try {
+      const aiResp = await fetch("https://api.openai.com/v1/audio/speech", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
           model: "gpt-4o-mini-tts",
-          input: text,
+          input: translatedText,
           voice: "alloy",
           format: "mp3",
         }),
@@ -123,36 +151,37 @@ app.post("/api/tts", async (req, res) => {
       console.warn("OpenAI TTS error:", err.message);
     }
 
-    // --- 2️⃣ Fallback to Google TTS ---
-    console.log(`Falling back to Google TTS for ${language}`);
+    // --- 3️⃣ Fallback to Google TTS ---
+    console.log(`Falling back to Google TTS for ${targetLang}`);
     const googleTTS = require("google-tts-api");
 
     let url;
     try {
-      url = googleTTS.getAudioUrl(text, {
-        lang: language,
+      url = googleTTS.getAudioUrl(translatedText, {
+        lang: targetLang,
         slow: false,
         host: "https://translate.google.com",
       });
     } catch (e) {
-      console.warn(`Google TTS doesn’t support ${language}, defaulting to English`);
-      url = googleTTS.getAudioUrl(text, {
+      console.warn(`Google TTS doesn’t support ${targetLang}, using English`);
+      url = googleTTS.getAudioUrl(translatedText, {
         lang: "en",
         slow: false,
         host: "https://translate.google.com",
       });
     }
 
-    // Stream Google TTS result
     const audioResp = await fetch(url);
     if (!audioResp.ok) throw new Error("Google TTS fetch failed");
+
     res.setHeader("Content-Type", "audio/mpeg");
     audioResp.body.pipe(res);
   } catch (err) {
-    console.error("Hybrid TTS error:", err);
+    console.error("Hybrid Translate+TTS error:", err);
     res.status(500).json({ error: err.message || "TTS service failed" });
   }
 });
+      
                    
     
     
