@@ -87,7 +87,7 @@ app.get('/api/seo-analyze', async (req, res) => {
 
 const { franc } = require('franc');
 //const googleTTS = require('google-tts-api');
-
+// --- Text-to-Speech route ---
 app.post('/api/tts', async (req, res) => {
   try {
     const { text, lang } = req.body;
@@ -95,57 +95,57 @@ app.post('/api/tts', async (req, res) => {
       return res.status(400).json({ error: 'Missing text or language' });
     }
 
-    let translatedText = text; // default fallback
-    const encodedText = encodeURIComponent(text);
+    const cleanText = text.trim();
 
-    // 1️⃣ Try detecting language of input
-    const detectedLang = franc(text);
-    const sourceLang = detectedLang === 'und' ? 'en' : detectedLang;
+    // Use Google Translate TTS (public endpoint)
+    // If Google TTS doesn't support the requested language,
+    // it will fall back to translating the text to that language first.
+    const ttsUrl = `https://translate.googleapis.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(
+      cleanText
+    )}&tl=${encodeURIComponent(lang)}&client=tw-ob`;
 
-    // 2️⃣ Try to translate
-    try {
-      const translationUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sourceLang}&tl=${lang}&dt=t&q=${encodedText}`;
-      const translationResponse = await fetch(translationUrl);
+    const response = await fetch(ttsUrl);
 
-      // Check content type before parsing
-      const ctype = translationResponse.headers.get('content-type') || '';
-      if (!ctype.includes('application/json')) {
-        console.warn('Non-JSON translation response, skipping translation.');
-      } else {
-        const translation = await translationResponse.json();
-        translatedText =
-          translation?.[0]?.map(item => item?.[0]).join('') || text;
-      }
-    } catch (err) {
-      console.warn('Translation failed, using original text instead:', err.message);
-    }
+    // If we get HTML instead of audio, Google probably didn’t support the language.
+    const contentType = response.headers.get('content-type') || '';
+    if (!contentType.includes('audio')) {
+      console.warn(`[TTS Fallback] ${lang} not supported directly, using translation fallback`);
 
-    // 3️⃣ Generate Google TTS audio (always runs, even if translation failed)
-    try {
-      const audioUrl = googleTTS.getAudioUrl(translatedText, {
-        lang,
-        slow: false,
-        host: 'https://translate.google.com',
-      });
+      // 1️⃣ Translate text to target language first
+      const transUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(
+        lang
+      )}&dt=t&q=${encodeURIComponent(cleanText)}`;
+      const transResp = await fetch(transUrl);
+      const transJson = await transResp.json();
 
-      // Optional: direct MP3 fetch and send as blob if you prefer download backend
-      const audioResponse = await fetch(audioUrl);
-      const audioBuffer = await audioResponse.arrayBuffer();
+      // Extract translated text safely
+      const translatedText =
+        transJson?.[0]?.map((seg) => seg[0]).join(' ') || cleanText;
+
+      // 2️⃣ Generate TTS from the translated text
+      const fallbackUrl = `https://translate.googleapis.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(
+        translatedText
+      )}&tl=${encodeURIComponent(lang)}&client=tw-ob`;
+
+      const fallbackResp = await fetch(fallbackUrl);
+      const audioBuffer = await fallbackResp.arrayBuffer();
 
       res.setHeader('Content-Type', 'audio/mpeg');
-      res.setHeader('Content-Disposition', `attachment; filename="speech.mp3"`);
-      res.send(Buffer.from(audioBuffer));
-    } catch (ttsErr) {
-      console.error('TTS generation failed:', ttsErr);
-      throw new Error('TTS generation failed: ' + ttsErr.message);
+      res.setHeader('Content-Disposition', 'inline; filename="tts.mp3"');
+      return res.send(Buffer.from(audioBuffer));
     }
-  } catch (error) {
-    console.error('TTS endpoint error:', error);
-    res.status(500).json({ error: 'TTS failed: ' + error.message });
+
+    // ✅ Primary TTS works
+    const audioBuffer = await response.arrayBuffer();
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Disposition', 'inline; filename="tts.mp3"');
+    res.send(Buffer.from(audioBuffer));
+  } catch (err) {
+    console.error('TTS error:', err);
+    res.status(500).json({ error: 'TTS failed', details: err.message });
   }
 });
-                      
-  
+    
 
 
 // --------------------
