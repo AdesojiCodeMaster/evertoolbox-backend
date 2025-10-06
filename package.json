@@ -1,4 +1,4 @@
-{
+ {
   "name": "evertoolbox-backend",
   "version": "1.0.0",
   "description": "Backend for EverToolbox - SEO, TTS, conversions, image, zip/unzip",
@@ -16,8 +16,9 @@
     "node-fetch": "^2.6.7",
     "sharp": "^0.32.1",
     "unzipper": "^0.10.11",
-    "uuid": "^9.0.0"
-  },
+    "uuid": "^9.0.0",
+    "franc": "^6.1.0"
+     },
   "engines": {
     "node": ">=16"
   }
