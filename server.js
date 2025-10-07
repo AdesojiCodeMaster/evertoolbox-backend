@@ -316,6 +316,193 @@ app.get('/api/temp/:id/:filename', (req, res) => {
   });
 });
 
+
+
+
+
+
+
+// ------------------------------
+// START: EverToolbox v2 Routes
+// ------------------------------
+
+//const express = require("express");
+//const fs = require("fs");
+//const path = require("path");
+//const archiver = require("archiver");
+const AdmZip = require("adm-zip");
+//const sharp = require("sharp");
+//const multer = require("multer");
+//const { exec } = require("child_process");
+
+// Ensure upload directory exists
+const UPLOAD_DIR = path.join(__dirname, "uploads");
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
+
+// Multer for file uploads
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+  filename: (req, file, cb) => cb(null, Date.now() + "-" + file.originalname),
+});
+const upload = multer({ storage });
+
+/* ===========================================================
+   1. FILE CONVERTER + COMPRESSION + BASIC EDITING
+   =========================================================== */
+app.post("/api/v2/file/convert", upload.single("file"), async (req, res) => {
+  try {
+    const { outputFormat, compressOnly, watermark, renameTo } = req.body;
+    const inputPath = req.file.path;
+    const inputName = path.basename(inputPath, path.extname(inputPath));
+    const outputName = renameTo || `${inputName}.${outputFormat}`;
+    const outputPath = path.join(UPLOAD_DIR, outputName);
+
+    if (compressOnly === "true") {
+      // Just compress the file into .zip
+      const archivePath = path.join(UPLOAD_DIR, `${inputName}.zip`);
+      const output = fs.createWriteStream(archivePath);
+      const archive = archiver("zip", { zlib: { level: 9 } });
+      archive.pipe(output);
+      archive.file(inputPath, { name: req.file.originalname });
+      await archive.finalize();
+      return res.download(archivePath, () => fs.unlinkSync(archivePath));
+    }
+
+    // Convert using LibreOffice (if installed on Render)
+    exec(`soffice --headless --convert-to ${outputFormat} "${inputPath}" --outdir "${UPLOAD_DIR}"`, async (err) => {
+      if (err) {
+        console.error("Conversion error:", err);
+        return res.status(500).send("File conversion failed.");
+      }
+
+      const convertedPath = path.join(UPLOAD_DIR, `${inputName}.${outputFormat}`);
+
+      // Optional watermark (basic text overlay for PDF using ghostscript)
+      if (watermark && outputFormat === "pdf") {
+        const watermarkedPath = path.join(UPLOAD_DIR, `wm_${outputName}`);
+        exec(
+          `gs -o "${watermarkedPath}" -sDEVICE=pdfwrite -c "/Helvetica 12 selectfont 100 100 moveto (${watermark}) show" -f "${convertedPath}"`,
+          (wmErr) => {
+            if (!wmErr) {
+              fs.unlinkSync(convertedPath);
+              return res.download(watermarkedPath, () => fs.unlinkSync(watermarkedPath));
+            } else {
+              console.warn("Watermark skipped:", wmErr);
+              return res.download(convertedPath, () => fs.unlinkSync(convertedPath));
+            }
+          }
+        );
+      } else {
+        return res.download(convertedPath, () => fs.unlinkSync(convertedPath));
+      }
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).send("File conversion failed.");
+  }
+});
+
+/* ===========================================================
+   2. IMAGE CONVERTER / THUMBNAIL GENERATOR
+   =========================================================== */
+app.post("/api/v2/image/process", upload.single("image"), async (req, res) => {
+  try {
+    const {
+      format = "png",
+      width,
+      height,
+      quality = 80,
+      ratioPreset,
+      bgColor,
+      textOverlay,
+    } = req.body;
+
+    const inputPath = req.file.path;
+    const outputName = Date.now() + "." + format;
+    const outputPath = path.join(UPLOAD_DIR, outputName);
+
+    let image = sharp(inputPath);
+
+    if (ratioPreset) {
+      const [wRatio, hRatio] = ratioPreset.split(":").map(Number);
+      const metadata = await image.metadata();
+      const newWidth = metadata.width;
+      const newHeight = Math.round((newWidth * hRatio) / wRatio);
+      image = image.resize(newWidth, newHeight, { fit: "cover" });
+    }
+
+    if (width && height) image = image.resize(parseInt(width), parseInt(height));
+    if (bgColor) image = image.flatten({ background: bgColor });
+    if (textOverlay) {
+      // Simple text overlay: optional SVG-based watermark
+      const svgText = `
+        <svg width="500" height="100">
+          <rect x="0" y="0" width="100%" height="100%" fill="none"/>
+          <text x="10" y="60" font-size="40" fill="white" opacity="0.6">${textOverlay}</text>
+        </svg>`;
+      image = image.composite([{ input: Buffer.from(svgText), gravity: "southeast" }]);
+    }
+
+    await image.toFormat(format, { quality: parseInt(quality) }).toFile(outputPath);
+
+    res.download(outputPath, () => fs.unlinkSync(outputPath));
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("Image processing failed.");
+  }
+});
+
+/* ===========================================================
+   3. ZIP / UNZIP TOOL
+   =========================================================== */
+app.post("/api/v2/zip", upload.array("files"), async (req, res) => {
+  try {
+    const zipName = `archive-${Date.now()}.zip`;
+    const zipPath = path.join(UPLOAD_DIR, zipName);
+    const output = fs.createWriteStream(zipPath);
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    archive.pipe(output);
+
+    req.files.forEach((file) => archive.file(file.path, { name: file.originalname }));
+    await archive.finalize();
+
+    output.on("close", () => {
+      res.download(zipPath, () => {
+        fs.unlinkSync(zipPath);
+        req.files.forEach((file) => fs.unlinkSync(file.path));
+      });
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("Zipping failed.");
+  }
+});
+
+app.post("/api/v2/unzip", upload.single("zipfile"), async (req, res) => {
+  try {
+    const zip = new AdmZip(req.file.path);
+    const extractDir = path.join(UPLOAD_DIR, "unzipped-" + Date.now());
+    zip.extractAllTo(extractDir, true);
+    fs.unlinkSync(req.file.path);
+
+    const files = fs.readdirSync(extractDir).map((f) => ({
+      name: f,
+      url: `/download/${f}`,
+    }));
+
+    res.json({ extracted: files });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("Unzipping failed.");
+  }
+});
+
+// ------------------------------
+// END: EverToolbox v2 Routes
+// ------------------------------
+
+
+
 // --------------------
 // Start server
 // --------------------
