@@ -336,7 +336,7 @@ const AdmZip = require("adm-zip");
 //const { exec } = require("child_process");
 
 // Ensure upload directory exists
-const UPLOAD_DIR = path.join(__dirname, "uploads");
+//const UPLOAD_DIR = path.join(__dirname, "uploads");
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
 
 // Multer for file uploads
