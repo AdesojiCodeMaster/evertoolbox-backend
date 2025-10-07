@@ -88,74 +88,48 @@ app.get('/api/seo-analyze', async (req, res) => {
 const { franc } = require('franc');
 // ====== TTS Handler (OpenAI + Google fallback) ======
    
-      app.post('/api/tts', async (req, res) => {
-  const { text, lang } = req.body;
-  if (!text) return res.status(400).json({ error: 'Missing text input.' });
-
+ app.post('/api/tts', async (req, res) => {
   try {
-    // 🥇 Try Google Translate TTS (native voice, free)
-    const googleUrl = `https://translate.googleapis.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(
-      text
-    )}&tl=${lang}&client=tw-ob`;
-
-    const googleResp = await fetch(googleUrl);
-    if (googleResp.ok) {
-      const googleBuffer = await googleResp.arrayBuffer();
-      console.log(`✅ Google TTS success: ${lang}`);
-      return res
-        .set({
-          'Content-Type': 'audio/mpeg',
-          'Content-Disposition': `inline; filename="tts-${lang}.mp3"`,
-        })
-        .send(Buffer.from(googleBuffer));
-    } else {
-      console.warn(`⚠️ Google TTS failed for ${lang}: ${googleResp.status}`);
+    const { text, lang } = req.body;
+    if (!text || !lang) {
+      return res.status(400).json({ error: 'Missing text or lang' });
     }
 
-    // 🥈 Try OpenAI fallback (if Google fails)
-    try {
-      const openaiResp = await fetch('https://api.openai.com/v1/audio/speech', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: 'gpt-4o-mini-tts',
-          voice: 'alloy',
-          input: text,
-        }),
-      });
+    // Step 1: Translate text to target language using Google Translate endpoint
+    const translateUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(lang)}&dt=t&q=${encodeURIComponent(text)}`;
+    const translateResp = await fetch(translateUrl);
+    const translateData = await translateResp.json();
 
-      if (!openaiResp.ok) {
-        const errText = await openaiResp.text();
-        throw new Error(`OpenAI error: ${errText}`);
-      }
-
-      const openaiBuffer = await openaiResp.arrayBuffer();
-      console.log(`✅ OpenAI TTS fallback success for ${lang}`);
-      return res
-        .set({
-          'Content-Type': 'audio/mpeg',
-          'Content-Disposition': `inline; filename="tts-${lang}.mp3"`,
-        })
-        .send(Buffer.from(openaiBuffer));
-    } catch (err) {
-      console.error(`❌ OpenAI TTS failed for ${lang}:`, err.message);
+    const translatedText = translateData[0]?.map(x => x[0]).join(' ');
+    if (!translatedText) {
+      return res.status(500).json({ error: 'Translation failed' });
     }
 
-    // 🧯 If both fail
-    console.error(`🚫 Both TTS engines failed for ${lang}`);
-    return res.status(500).json({
-      error: `TTS failed for ${lang}. Try another language or check text input.`,
+    console.log(`Translated to [${lang}]:`, translatedText);
+
+    // Step 2: Generate TTS from translated text
+    const googleTTS = await import('google-tts-api');
+    const url = googleTTS.getAudioUrl(translatedText, {
+      lang,
+      slow: false,
+      host: 'https://translate.google.com',
     });
 
+    // Step 3: Fetch MP3 and send it back
+    const audioResp = await fetch(url);
+    const audioBuf = await audioResp.arrayBuffer();
+
+    res.set({
+      'Content-Type': 'audio/mpeg',
+      'Content-Disposition': 'attachment; filename="speech.mp3"',
+    });
+    res.send(Buffer.from(audioBuf));
   } catch (err) {
-    console.error('Unexpected TTS error:', err);
-    return res.status(500).json({ error: err.message });
+    console.error('TTS error:', err);
+    res.status(500).json({ error: 'TTS generation failed' });
   }
 });
-          
+      
 
 
 
