@@ -86,68 +86,76 @@ app.get('/api/seo-analyze', async (req, res) => {
 
 
 const { franc } = require('franc');
-//const googleTTS = require('google-tts-api');
-// Add this near the top if not already
-//const express = require('express');
-//const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
-//const googleTTS = require('google-tts-api');
 
-//const app = express();
-//app.use(express.json());
 
-// ✅ Supported languages for Google TTS
-const SUPPORTED_LANGS = [
-  'af','sq','ar','hy','bn','bs','ca','zh','zh-CN','zh-TW','hr','cs','da','nl','en','eo','fi',
-  'fr','de','el','gu','hi','hu','is','id','it','ja','jw','kn','km','ko','la','lv','mk','ml',
-  'mr','my','ne','no','pl','pt','ro','ru','si','sk','es','su','sw','sv','ta','te','th','tr',
-  'uk','ur','vi','cy'
-];
-
-// ✅ Helper: Translate text using Google Translate free endpoint
-async function translateText(text, targetLang) {
-  const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${targetLang}&dt=t&q=${encodeURIComponent(text)}`;
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error(`Translate failed (${resp.status})`);
-  const data = await resp.json();
-  return data[0].map(x => x[0]).join('');
-}
-
-// ✅ /api/tts route
+// ====== TTS Handler (OpenAI + Google fallback) ======
 app.post('/api/tts', async (req, res) => {
+  const { text, lang } = req.body;
+
+  if (!text || !lang) {
+    return res.status(400).json({ error: 'Missing text or lang' });
+  }
+
   try {
-    let { text, lang } = req.body;
-    if (!text) return res.status(400).json({ error: 'Missing text' });
-    if (!lang) lang = 'en';
+    console.log(`🔊 Generating TTS for [${lang}]...`);
 
-    text = text.trim();
-    let translated = false;
+    // --- Try OpenAI first ---
+    try {
+      const openaiResp = await fetch("https://api.openai.com/v1/audio/speech", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-mini-tts",
+          voice: "alloy",
+          input: text,
+          language: lang
+        })
+      });
 
-    // If not supported by Google TTS, fallback to English
-    if (!SUPPORTED_LANGS.includes(lang)) {
-      const original = text;
-      text = await translateText(original, 'en');
-      lang = 'en';
-      translated = true;
+      if (openaiResp.ok) {
+        const buffer = Buffer.from(await openaiResp.arrayBuffer());
+        res.setHeader('Content-Type', 'audio/mpeg');
+        res.setHeader('Content-Disposition', 'attachment; filename="speech.mp3"');
+        return res.send(buffer);
+      } else {
+        const errText = await openaiResp.text();
+        console.warn(`⚠️ OpenAI TTS failed for ${lang}:`, errText);
+      }
+    } catch (err) {
+      console.warn(`⚠️ OpenAI TTS error: ${err.message}`);
     }
 
-    // Generate TTS
-    const url = googleTTS.getAudioUrl(text, { lang, slow: false, host: 'https://translate.google.com' });
-    const audio = await fetch(url);
-    const buffer = await audio.arrayBuffer();
+    // --- Fallback to Google TTS ---
+    try {
+      const googleTTS = require('google-tts-api');
+      const url = googleTTS.getAudioUrl(text, {
+        lang,
+        slow: false,
+        host: 'https://translate.google.com',
+      });
 
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Content-Disposition', 'attachment; filename="speech.mp3"');
-    if (translated) res.setHeader('X-TTS-Fallback', 'Translated to English (language not supported)');
-    res.send(Buffer.from(buffer));
+      const audioResp = await fetch(url);
+      if (!audioResp.ok) throw new Error('Google TTS fetch failed');
+      const buffer = Buffer.from(await audioResp.arrayBuffer());
 
+      res.setHeader('Content-Type', 'audio/mpeg');
+      res.setHeader('Content-Disposition', 'attachment; filename="speech.mp3"');
+      return res.send(buffer);
+    } catch (err) {
+      console.error('❌ Google TTS fallback failed:', err);
+      return res.status(500).json({ error: 'TTS failed: All methods failed' });
+    }
   } catch (err) {
-    console.error('TTS Error:', err);
-    res.status(500).json({ error: 'TTS failed: ' + err.message });
+    console.error('❌ Unexpected TTS error:', err);
+    res.status(500).json({ error: 'Server error during TTS' });
   }
 });
+        
 
-    
-    
+
 
 
 // --------------------
