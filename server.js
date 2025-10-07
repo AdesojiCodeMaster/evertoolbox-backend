@@ -340,11 +340,11 @@ const AdmZip = require("adm-zip");
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
 
 // Multer for file uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-  filename: (req, file, cb) => cb(null, Date.now() + "-" + file.originalname),
-});
-const upload = multer({ storage });
+//const storage = multer.diskStorage({
+ // destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+//  filename: (req, file, cb) => cb(null, Date.now() + "-" + file.originalname),
+//});
+//const upload = multer({ storage });
 
 /* ===========================================================
    1. FILE CONVERTER + COMPRESSION + BASIC EDITING
