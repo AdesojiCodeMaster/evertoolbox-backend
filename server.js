@@ -92,8 +92,8 @@ const express = require('express');
 const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 const googleTTS = require('google-tts-api');
 
-const app = express();
-app.use(express.json());
+//const app = express();
+//app.use(express.json());
 
 // ✅ Supported languages for Google TTS
 const SUPPORTED_LANGS = [
