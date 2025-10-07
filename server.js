@@ -89,7 +89,7 @@ const { franc } = require('franc');
 //const googleTTS = require('google-tts-api');
 // Add this near the top if not already
 //const express = require('express');
-const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
+//const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 const googleTTS = require('google-tts-api');
 
 //const app = express();
