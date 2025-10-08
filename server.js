@@ -2,7 +2,7 @@
 // Usage: node server.js
 // NOTE: For document conversions this uses "soffice" (LibreOffice) which must be installed on the host.
 
-const express = require('express');
+//const express = require('express');
 const multer = require('multer');
 const fetch = require('node-fetch'); // v2 style require
 const cheerio = require('cheerio');
@@ -325,7 +325,7 @@ app.get('/api/temp/:id/:filename', (req, res) => {
 // ------------------------------
 // START: EverToolbox v2 Routes
 // ------------------------------
-//import express from "express";
+import express from "express";
 //import multer from "multer";
 //import fs from "fs";
 //import path from "path";
