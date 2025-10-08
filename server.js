@@ -332,7 +332,7 @@ app.get('/api/temp/:id/:filename', (req, res) => {
 //import archiver from "archiver";
 //import { exec } from "child_process";
 //import sharp from "sharp";
-import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+//import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 import { fileURLToPath } from "url";
 import { dirname } from "path";
 
@@ -347,7 +347,7 @@ const __dirname = dirname(__filename);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const UPLOAD_DIR = path.join(__dirname, "uploads");
+//const UPLOAD_DIR = path.join(__dirname, "uploads");
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
   
 
