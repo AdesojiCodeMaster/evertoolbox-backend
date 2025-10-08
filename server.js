@@ -36,6 +36,9 @@ import cors from "cors";
 import { v4 as uuidv4 } from "uuid";
 
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
 // simple safe filename sanitizer (no external dependency)
 const sanitize = (name = "") => name.replace(/[^a-zA-Z0-9._-]/g, "_");
 //çonst safeFilename = sanitize;
@@ -360,8 +363,7 @@ app.get('/api/temp/:id/:filename', (req, res) => {
 
 
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+
 //const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
