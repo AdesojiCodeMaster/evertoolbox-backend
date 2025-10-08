@@ -3,15 +3,15 @@
 // NOTE: For document conversions this uses "soffice" (LibreOffice) which must be installed on the host.
 
 //const express = require('express');
-const multer = require('multer');
+//const multer = require('multer');
 const fetch = require('node-fetch'); // v2 style require
 const cheerio = require('cheerio');
-const fs = require('fs');
-const path = require('path');
-const archiver = require('archiver');
+//const fs = require('fs');
+//const path = require('path');
+//const archiver = require('archiver');
 const unzipper = require('unzipper');
-const { exec } = require('child_process');
-const sharp = require('sharp');
+//const { exec } = require('child_process');
+//const sharp = require('sharp');
 const googleTTS = require('google-tts-api'); // generate base64 audio
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
@@ -326,13 +326,13 @@ app.get('/api/temp/:id/:filename', (req, res) => {
 // START: EverToolbox v2 Routes
 // ------------------------------
 import express from "express";
-//import multer from "multer";
-//import fs from "fs";
-//import path from "path";
-//import archiver from "archiver";
-//import { exec } from "child_process";
-//import sharp from "sharp";
-//import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+import multer from "multer";
+import fs from "fs";
+import path from "path";
+import archiver from "archiver";
+import { exec } from "child_process";
+import sharp from "sharp";
+import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 import { fileURLToPath } from "url";
 import { dirname } from "path";
 
