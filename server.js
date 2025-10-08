@@ -34,6 +34,7 @@ import unzipper from "unzipper";
 import googleTTS from "google-tts-api";
 import cors from "cors";
 import { v4 as uuidv4 } from "uuid";
+import { franc } from 'franc';
 
 
 const __filename = fileURLToPath(import.meta.url);
@@ -116,7 +117,7 @@ app.get('/api/seo-analyze', async (req, res) => {
 // Place this near other routes in your server.js
 
 
-const { franc } = require('franc');
+//const { franc } = require('franc');
 // ====== TTS Handler (OpenAI + Google fallback) ======
    
  app.post('/api/tts', async (req, res) => {
