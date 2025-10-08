@@ -34,7 +34,11 @@ import unzipper from "unzipper";
 import googleTTS from "google-tts-api";
 import cors from "cors";
 import { v4 as uuidv4 } from "uuid";
-import sanitize from "sanitize-filename";     
+
+
+// simple safe filename sanitizer (no external dependency)
+const sanitize = (name = "") => name.replace(/[^a-zA-Z0-9._-]/g, "_");
+
 
 
 
