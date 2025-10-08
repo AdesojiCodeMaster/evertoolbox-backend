@@ -325,13 +325,13 @@ app.get('/api/temp/:id/:filename', (req, res) => {
 // ------------------------------
 // START: EverToolbox v2 Routes
 // ------------------------------
-import express from "express";
-import multer from "multer";
-import fs from "fs";
-import path from "path";
-import archiver from "archiver";
-import { exec } from "child_process";
-import sharp from "sharp";
+//import express from "express";
+//import multer from "multer";
+//import fs from "fs";
+//import path from "path";
+//import archiver from "archiver";
+//import { exec } from "child_process";
+//import sharp from "sharp";
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 import { fileURLToPath } from "url";
 import { dirname } from "path";
@@ -343,7 +343,7 @@ import { dirname } from "path";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const app = express();
+//const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
