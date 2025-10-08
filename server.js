@@ -329,16 +329,16 @@ app.get('/api/temp/:id/:filename', (req, res) => {
 
 //const AdmZip = require("adm-zip");
 
-
-
 /* ===========================================================
-   1. FILE CONVERTER + COMPRESSION + WATERMARK (v3)
-   Works without LibreOffice or Ghostscript
+   1. FILE CONVERTER + COMPRESSION + WATERMARK (final version)
    =========================================================== */
+
+
 const { PDFDocument, rgb, StandardFonts } = require("pdf-lib");
 const AdmZip = require("adm-zip");
 
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
+
 
 
 app.post("/api/v3/file/convert", upload.single("file"), async (req, res) => {
@@ -348,96 +348,121 @@ app.post("/api/v3/file/convert", upload.single("file"), async (req, res) => {
     const originalName = req.file.originalname;
     const inputExt = path.extname(originalName).replace(".", "").toLowerCase();
     const baseName = path.basename(originalName, path.extname(originalName));
-    const newName = renameTo || `${baseName}.${outputFormat}`;
-    const outputPath = path.join(UPLOAD_DIR, newName);
+    const finalName = renameTo || `${baseName}.${outputFormat || inputExt}`;
+    const outputPath = path.join(UPLOAD_DIR, finalName);
+
+    let buffer = fs.readFileSync(inputPath);
 
     // -----------------------------
-    // 1️⃣ Compression only
+    // 1️⃣ COMPRESSION ONLY
     // -----------------------------
     if (compressOnly === "true") {
-      const zip = new AdmZip();
-      zip.addLocalFile(inputPath);
-      const zipBuffer = zip.toBuffer();
+      // Image compression
+      if (["jpg", "jpeg", "png", "webp"].includes(inputExt)) {
+        buffer = await sharp(inputPath)
+          .toFormat(inputExt === "jpg" ? "jpeg" : inputExt, { quality: 70 })
+          .toBuffer();
+        fs.unlinkSync(inputPath);
+        res.set({
+          "Content-Type": `image/${inputExt === "jpg" ? "jpeg" : inputExt}`,
+          "Content-Disposition": `attachment; filename="${finalName}"`,
+        });
+        return res.end(buffer);
+      }
 
-      res.set({
-        "Content-Type": "application/zip",
-        "Content-Disposition": `attachment; filename="${baseName}.zip"`,
-      });
-      return res.end(zipBuffer);
+      // PDF compression (lightweight, not zip)
+      if (inputExt === "pdf") {
+        const pdfDoc = await PDFDocument.load(buffer);
+        const compressed = await pdfDoc.save({ useObjectStreams: true });
+        fs.unlinkSync(inputPath);
+        res.set({
+          "Content-Type": "application/pdf",
+          "Content-Disposition": `attachment; filename="${finalName}"`,
+        });
+        return res.end(compressed);
+      }
+
+      // Other formats: just return original
+      res.download(inputPath, finalName, () => fs.unlinkSync(inputPath));
+      return;
     }
 
     // -----------------------------
-    // 2️⃣ Handle conversions
+    // 2️⃣ CONVERSIONS
     // -----------------------------
-    let buffer = fs.readFileSync(inputPath);
-
-    // ---- text -> pdf ----
     if (inputExt === "txt" && outputFormat === "pdf") {
       const pdfDoc = await PDFDocument.create();
       const page = pdfDoc.addPage();
       const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
       const text = buffer.toString("utf8");
-      page.drawText(text, { x: 50, y: 700, size: 12, font });
+      const { width, height } = page.getSize();
+      page.drawText(text, {
+        x: 50,
+        y: height - 50,
+        size: 12,
+        font,
+        maxWidth: width - 100,
+      });
       buffer = await pdfDoc.save();
-    }
-
-    // ---- pdf -> txt ----
-    else if (inputExt === "pdf" && outputFormat === "txt") {
-      return res.status(400).send("PDF to text not supported on Render (need OCR).");
-    }
-
-    // ---- image conversions ----
+      res.type("application/pdf");
+    } 
     else if (["jpg", "jpeg", "png", "webp"].includes(inputExt)) {
-      const img = sharp(inputPath);
+      let img = sharp(inputPath);
+
+      // Add watermark if present
       if (watermark) {
-        // overlay watermark text using SVG
         const meta = await img.metadata();
         const svg = `<svg width="${meta.width}" height="${meta.height}">
-          <text x="50%" y="95%" font-size="36" text-anchor="middle" fill="rgba(255,255,255,0.7)">
-            ${watermark}
-          </text></svg>`;
-        img.composite([{ input: Buffer.from(svg), gravity: "south" }]); 
+          <text x="50%" y="95%" font-size="36" text-anchor="middle"
+            fill="rgba(255,255,255,0.6)">${watermark}</text>
+        </svg>`;
+        img = img.composite([{ input: Buffer.from(svg), gravity: "south" }]);
       }
 
       if (outputFormat === "png") buffer = await img.png({ quality: 90 }).toBuffer();
-      else if (["jpg", "jpeg"].includes(outputFormat)) buffer = await img.jpeg({ quality: 90 }).toBuffer();
-      else if (outputFormat === "webp") buffer = await img.webp({ quality: 90 }).toBuffer();
-    }
+      else if (["jpg", "jpeg"].includes(outputFormat))
+        buffer = await img.jpeg({ quality: 90 }).toBuffer();
+      else if (outputFormat === "webp")
+        buffer = await img.webp({ quality: 90 }).toBuffer();
 
-    // ---- pdf watermark only ----
+      res.type(`image/${outputFormat === "jpg" ? "jpeg" : outputFormat}`);
+    } 
     else if (inputExt === "pdf" && watermark) {
       const pdfDoc = await PDFDocument.load(buffer);
       const pages = pdfDoc.getPages();
       const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-      pages.forEach((page) => {
+      for (const page of pages) {
+        const { width, height } = page.getSize();
         page.drawText(watermark, {
-          x: 50,
-          y: 50,
-          size: 18,
+          x: width / 2 - watermark.length * 2,
+          y: height / 2,
+          size: 36,
           color: rgb(0.8, 0.8, 0.8),
+          rotate: { degrees: 45 },
         });
-      });
+      }
       buffer = await pdfDoc.save();
+      res.type("application/pdf");
+    } else {
+      res.type("application/octet-stream");
     }
 
     // -----------------------------
-    // 3️⃣ Return file
+    // 3️⃣ SEND RESULT
     // -----------------------------
-    res.set({
-      "Content-Type": "application/octet-stream",
-      "Content-Disposition": `attachment; filename="${newName}"`,
-    });
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${finalName}"`
+    );
     res.send(buffer);
 
-    // cleanup
     fs.unlinkSync(inputPath);
   } catch (err) {
-   // console.error("File conversion failed:", err);
-    console.error("Detailed file conversion error:", err.message, err.stack);
-    
-    res.status(500).send("File conversion failed.");
+    console.error("Conversion/compression error:", err);
+    res.status(500).send("File conversion or compression failed.");
   }
 });
+
       
 
 /* ===========================================================
