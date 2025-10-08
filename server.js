@@ -29,7 +29,7 @@ import sharp from "sharp";
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 import { fileURLToPath } from "url";
 import { dirname } from "path";
-import cheerio from "cheerio";
+import * as cheerio from "cheerio";
 import unzipper from "unzipper";
 import googleTTS from "google-tts-api";
 import cors from "cors";
@@ -38,8 +38,7 @@ import { v4 as uuidv4 } from "uuid";
 
 // simple safe filename sanitizer (no external dependency)
 const sanitize = (name = "") => name.replace(/[^a-zA-Z0-9._-]/g, "_");
-
-
+const safeFilename = sanitize;
 
 
 
