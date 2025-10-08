@@ -325,7 +325,31 @@ app.get('/api/temp/:id/:filename', (req, res) => {
 // ------------------------------
 // START: EverToolbox v2 Routes
 // ------------------------------
+import express from "express";
+import multer from "multer";
+import fs from "fs";
+import path from "path";
+import archiver from "archiver";
+import { exec } from "child_process";
+import sharp from "sharp";
+import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+import { fileURLToPath } from "url";
+import { dirname } from "path";
 
+
+
+
+
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const app = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+const UPLOAD_DIR = path.join(__dirname, "uploads");
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+  
 
 //const AdmZip = require("adm-zip");
 
@@ -337,7 +361,7 @@ app.get('/api/temp/:id/:filename', (req, res) => {
 const { PDFDocument, rgb, StandardFonts } = require("pdf-lib");
 const AdmZip = require("adm-zip");
 
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
+// if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
 
 /* ============================
    Replace existing /api/v3/file/convert with this
