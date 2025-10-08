@@ -432,7 +432,9 @@ app.post("/api/v3/file/convert", upload.single("file"), async (req, res) => {
     // cleanup
     fs.unlinkSync(inputPath);
   } catch (err) {
-    console.error("File conversion failed:", err);
+   // console.error("File conversion failed:", err);
+    console.error("Detailed file conversion error:", err.message, err.stack);
+    
     res.status(500).send("File conversion failed.");
   }
 });
