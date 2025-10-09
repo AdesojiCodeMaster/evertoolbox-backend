@@ -385,7 +385,7 @@ if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
    - Real PDF compression
 ======================================== */
 
-import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+//import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 import mammoth from "mammoth";
 
 /* ---------- CONVERT ---------- */
