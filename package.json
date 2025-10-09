@@ -1,5 +1,6 @@
  {
   "name": "evertoolbox-backend",
+  "type": "module",
   "version": "1.0.0",
   "description": "Backend for EverToolbox - SEO, TTS, conversions, image, zip/unzip",
   "main": "server.js",
