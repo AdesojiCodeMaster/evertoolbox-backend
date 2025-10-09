@@ -373,29 +373,25 @@ app.use(express.urlencoded({ extended: true }));
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
   
 
-//const AdmZip = require("adm-zip");
 
 /* ===========================================================
    1. FILE CONVERTER + COMPRESSION + WATERMARK (final version)
    =========================================================== */
 
-
-//const { PDFDocument, rgb, StandardFonts } = require("pdf-lib");
-//const AdmZip = require("adm-zip");
-
-// if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
-
 /* ============================
-   Replace existing /api/v3/file/convert with this
-   and add /api/v3/file/compress
-   ============================ */
+  FINAL /api/v3/file/convert
+  and /api/v3/file/compress
+  (paste to replace existing v3 route blocks)
+   - Uses pdfkit + mammoth + sharp + pdf-lib
+   - Keeps file extensions; compression uses 90-95% quality
+============================ */
 
 app.post("/api/v3/file/convert", upload.single("file"), async (req, res) => {
   try {
-    console.log("[v3/convert] request received:", req.file && req.file.originalname, req.body);
+    console.log("[v3/convert] request:", req.file && req.file.originalname, req.body);
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
-    const { outputFormat, watermark, renameTo } = req.body;
+    const { outputFormat, watermark, renameTo } = req.body || {};
     const inputPath = req.file.path;
     const originalName = req.file.originalname;
     const inputExt = path.extname(originalName).slice(1).toLowerCase();
@@ -403,89 +399,122 @@ app.post("/api/v3/file/convert", upload.single("file"), async (req, res) => {
     const finalExt = (outputFormat || inputExt || "").replace(/^\./, "").toLowerCase();
     const finalName = (renameTo && String(renameTo).trim()) || `${baseName}.${finalExt}`;
 
-    // Helper: send buffer as attachment and cleanup
+    // Helper to send buffer and cleanup input
     const sendBuffer = (buf, mime, filename) => {
       res.setHeader("Content-Type", mime);
       res.setHeader("Content-Disposition", `attachment; filename="${safeFilename(filename)}"`);
-      try { fs.unlinkSync(inputPath); } catch (e) {}
+      try { fs.unlinkSync(inputPath); } catch (e) { /* ignore */ }
       return res.end(buf);
     };
 
-    // ----------------------------
-    // TXT -> PDF
-    // ----------------------------
+    // -------------------------
+    // TXT -> PDF (pdfkit, A4, Helvetica)
+    // -------------------------
     if (inputExt === "txt" && finalExt === "pdf") {
+      const pdfkitMod = await import("pdfkit");
+      const PDFDocumentKit = pdfkitMod.default || pdfkitMod;
       const text = fs.readFileSync(inputPath, "utf8");
-      const doc = await PDFDocument.create();
-      const font = await doc.embedFont(StandardFonts.Helvetica);
-      const pageWidth = 612, pageHeight = 792;
-      const margin = 48;
-      const lineHeight = 14;
-      const maxWidth = pageWidth - margin * 2;
-      // simple wrap: split into lines of ~80 chars (good enough)
-      const words = text.replace(/\r/g, "").split(/\s+/);
-      const lines = [];
-      let cur = "";
-      for (const w of words) {
-        if ((cur + " " + w).trim().length > 90) { lines.push(cur.trim()); cur = w; }
-        else cur = (cur + " " + w).trim();
-      }
-      if (cur) lines.push(cur);
-      let i = 0;
-      while (i < lines.length) {
-        const page = doc.addPage([pageWidth, pageHeight]);
-        let y = pageHeight - margin;
-        while (i < lines.length && y > margin) {
-          page.drawText(lines[i].slice(0, 1000), { x: margin, y, size: 12, font, maxWidth });
-          y -= lineHeight;
-          i++;
-        }
-      }
-      const outBuffer = await doc.save();
-      return sendBuffer(Buffer.from(outBuffer), "application/pdf", finalName);
+      const doc = new PDFDocumentKit({ size: "A4", margin: 48 });
+      doc.font("Helvetica");
+      // stream into buffer
+      const chunks = [];
+      doc.on("data", (c) => chunks.push(c));
+      doc.on("end", () => {
+        const out = Buffer.concat(chunks);
+        return sendBuffer(out, "application/pdf", finalName);
+      });
+      // write text with basic wrap
+      const lines = text.replace(/\r/g, "").split(/\n/);
+      lines.forEach((ln) => { doc.text(ln, { lineGap: 4 }); });
+      doc.end();
+      return;
     }
 
-    // ----------------------------
-    // Image -> Image or Image -> PDF
-    // ----------------------------
+    // -------------------------
+    // DOCX -> PDF (mammoth -> text -> pdfkit)
+    // -------------------------
+    if (["docx"].includes(inputExt) && finalExt === "pdf") {
+      const mammoth = (await import("mammoth")).default || (await import("mammoth"));
+      const pdfkitMod = await import("pdfkit");
+      const PDFDocumentKit = pdfkitMod.default || pdfkitMod;
+      try {
+        const result = await mammoth.extractRawText({ path: inputPath });
+        const text = result.value || "";
+        const doc = new PDFDocumentKit({ size: "A4", margin: 48 });
+        doc.font("Helvetica");
+        const chunks = [];
+        doc.on("data", (c) => chunks.push(c));
+        doc.on("end", () => {
+          const out = Buffer.concat(chunks);
+          return sendBuffer(out, "application/pdf", finalName);
+        });
+        const lines = text.replace(/\r/g, "").split(/\n/);
+        lines.forEach((ln) => { doc.text(ln, { lineGap: 4 }); });
+        doc.end();
+        return;
+      } catch (err) {
+        console.error("[v3/convert] DOCX->PDF error:", err);
+        try { fs.unlinkSync(inputPath); } catch(e) {}
+        return res.status(500).json({ error: "DOCX -> PDF conversion failed." });
+      }
+    }
+
+    // -------------------------
+    // Image input: image -> image/pdf
+    // -------------------------
     if (["jpg", "jpeg", "png", "webp", "avif", "tiff"].includes(inputExt)) {
       let img = sharp(inputPath, { failOnError: false });
 
-      // watermark (simple svg)
+      // watermark overlay (SVG)
       if (watermark && String(watermark).trim()) {
         const meta = await img.metadata();
         const svg = `<svg width="${meta.width}" height="${meta.height}">
-          <text x="50%" y="${Math.round(meta.height*0.95)}" font-size="36" text-anchor="middle" fill="rgba(255,255,255,0.6)">${escapeXml(String(watermark))}</text>
+          <text x="50%" y="${Math.round(meta.height * 0.95)}" font-size="36" text-anchor="middle" fill="rgba(255,255,255,0.6)">${escapeXml(String(watermark))}</text>
         </svg>`;
         img = img.composite([{ input: Buffer.from(svg), gravity: "south" }]);
       }
 
       // image -> pdf
       if (finalExt === "pdf") {
-        const outBuf = await img.pdf({ quality: 90 }).toBuffer();
-        return sendBuffer(outBuf, "application/pdf", finalName);
+        // pdfkit can embed images but sharp can create a PDF buffer directly using a PNG/JPEG input
+        // create PNG buffer and embed in PDF via pdfkit
+        const pngBuf = await img.png({ quality: 95 }).toBuffer();
+        const pdfkitMod = await import("pdfkit");
+        const PDFDocumentKit = pdfkitMod.default || pdfkitMod;
+        const doc = new PDFDocumentKit({ autoFirstPage: false });
+        const chunks = [];
+        doc.on("data", (c) => chunks.push(c));
+        doc.on("end", () => {
+          const out = Buffer.concat(chunks);
+          return sendBuffer(out, "application/pdf", finalName);
+        });
+        const meta = await sharp(pngBuf).metadata();
+        doc.addPage({ size: [meta.width, meta.height], margin: 0 });
+        doc.image(pngBuf, 0, 0, { width: meta.width, height: meta.height });
+        doc.end();
+        return;
       }
 
-      // image -> image formats
+      // image -> image (keep same type if requested)
       if (["jpg", "jpeg", "png", "webp"].includes(finalExt)) {
         const fmt = finalExt === "jpg" ? "jpeg" : finalExt;
-        const outBuf = await img.toFormat(fmt, { quality: 90 }).toBuffer();
+        // quality 90-95 as requested
+        const outBuf = await img.toFormat(fmt, { quality: 92 }).toBuffer();
         const mime = fmt === "jpeg" ? "image/jpeg" : `image/${fmt}`;
         return sendBuffer(outBuf, mime, finalName);
       }
 
-      return res.status(400).json({ error: "Unsupported target format for an image file." });
+      return res.status(400).json({ error: "Unsupported target format for image input." });
     }
 
-    // ----------------------------
-    // PDF -> (watermark) or other
-    // ----------------------------
+    // -------------------------
+    // PDF input: watermark only (or unsupported conversions)
+    // -------------------------
     if (inputExt === "pdf") {
-      const pdfBuffer = fs.readFileSync(inputPath);
+      const pdfBuf = fs.readFileSync(inputPath);
 
-      // watermark PDF
       if (watermark && String(watermark).trim()) {
-        const pdfDoc = await PDFDocument.load(pdfBuffer);
+        const pdfDoc = await PDFDocument.load(pdfBuf);
         const pages = pdfDoc.getPages();
         const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
         for (const page of pages) {
@@ -503,87 +532,76 @@ app.post("/api/v3/file/convert", upload.single("file"), async (req, res) => {
         return sendBuffer(Buffer.from(out), "application/pdf", finalName);
       }
 
-      // PDF -> image conversions not supported here
-      if (finalExt === "txt") {
-        return res.status(501).json({ error: "PDF → TXT conversion (OCR) is not supported on this server." });
-      }
-
-      return res.status(400).json({ error: "Unsupported conversion for PDF input." });
+      return res.status(400).json({ error: "PDF input: specify a watermark or use another endpoint for conversion." });
     }
 
-    // ----------------------------
-    // Office documents (docx, odt, etc.)
-    // ----------------------------
-    if (["doc", "docx", "odt", "ppt", "pptx", "xls", "xlsx"].includes(inputExt)) {
-      // Try using soffice if available (best-effort)
-      if (!finalExt || finalExt !== "pdf") {
-        return res.status(400).json({ error: "Office conversions in this route currently only support -> PDF. Use the dedicated convert-doc route if needed." });
-      }
-      // run LibreOffice if present
-      const cmd = `soffice --headless --convert-to pdf --outdir "${UPLOAD_DIR}" "${inputPath}"`;
-      console.log("[v3/convert] calling soffice:", cmd);
-      return exec(cmd, (err /* , stdout, stderr */) => {
-        if (err) {
-          console.error("[v3/convert] soffice failed:", err);
-          return res.status(500).json({ error: "Server conversion failed (LibreOffice not available or conversion error)." });
-        }
-        const outFile = path.join(UPLOAD_DIR, `${baseName}.pdf`);
-        if (!fs.existsSync(outFile)) return res.status(500).json({ error: "Converted file not found after soffice." });
-        res.download(outFile, finalName, (dlErr) => {
-          try { fs.unlinkSync(inputPath); } catch (e) {}
-          try { fs.unlinkSync(outFile); } catch (e) {}
-          if (dlErr) console.error("[v3/convert] download error:", dlErr);
-        });
-      });
-    }
-
-    // ----------------------------
-    // Fallback: unsupported input type
-    // ----------------------------
+    // -------------------------
+    // Unsupported input fallback
+    // -------------------------
     return res.status(400).json({ error: "Unsupported input file type for conversion on this endpoint." });
+
   } catch (err) {
     console.error("[v3/convert] error:", err);
+    try { if (req.file && req.file.path) fs.unlinkSync(req.file.path); } catch (e) {}
     return res.status(500).json({ error: "File conversion failed.", details: err.message });
   }
-}); // end /api/v3/file/convert
+});
+
 
 
 /* ============================
-   Add /api/v3/file/compress
-   (client expects this endpoint)
-   ============================ */
+   FINAL /api/v3/file/compress
+   - Keeps same extension
+   - Images compressed at 92% quality by default (90-95 requested)
+   - PDF lightly rewritten (pdf-lib) which often reduces size
+============================ */
 app.post("/api/v3/file/compress", upload.single("file"), async (req, res) => {
   try {
-    console.log("[v3/compress] request received:", req.file && req.file.originalname, req.body);
+    console.log("[v3/compress] request:", req.file && req.file.originalname, req.body);
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
     const inputPath = req.file.path;
     const originalName = req.file.originalname;
     const ext = path.extname(originalName).slice(1).toLowerCase();
     const baseName = path.basename(originalName, path.extname(originalName));
-    const quality = parseInt(req.body.quality || req.query.quality || "75", 10);
 
-    // Image compression: convert to webp/jpeg with quality to reduce size
-    if (["jpg", "jpeg", "png", "webp", "avif"].includes(ext)) {
-      // choose target format: keep same for jpeg, convert png->webp by default for better compression
-      const targetFormat = (ext === "png") ? "webp" : (ext === "jpg" ? "jpeg" : ext);
-      const outBuf = await sharp(inputPath, { failOnError: false })
-        .toFormat(targetFormat === "jpg" ? "jpeg" : targetFormat, { quality: Math.max(30, Math.min(quality, 95)) })
-        .toBuffer();
+    // default quality target 92 (user requested 90-95 visible & clear)
+    const quality = Math.max(70, Math.min(parseInt(req.body.quality || "92", 10), 95));
 
-      // cleanup input and return
+    // Images: compress and keep same extension
+    if (["jpg", "jpeg", "png", "webp", "avif", "tiff"].includes(ext)) {
+      const fmt = (ext === "jpg") ? "jpeg" : ext;
+      // For PNG: try to compress as PNG with quality-like options; sharp's png compression is limited,
+      // so use png -> png with compressionLevel, but keep it same ext.
+      let outBuf;
+      if (fmt === "png") {
+        // PNG: reduce dimensions slightly if large to save bytes while keeping quality
+        const meta = await sharp(inputPath).metadata();
+        let transformer = sharp(inputPath, { failOnError: false }).png({ compressionLevel: 6 });
+        // if image is very large, downscale to max 2000px
+        const maxDim = Math.max(meta.width || 0, meta.height || 0);
+        if (maxDim > 2000) transformer = transformer.resize({ width: 2000, height: null, fit: "inside" });
+        outBuf = await transformer.toBuffer();
+      } else {
+        // jpeg/webp/avif: set quality
+        const transformer = sharp(inputPath, { failOnError: false }).toFormat(fmt, { quality });
+        outBuf = await transformer.toBuffer();
+      }
+
+      // cleanup and return
       try { fs.unlinkSync(inputPath); } catch (e) {}
-      const outName = `${baseName}_compressed.${targetFormat === "jpeg" ? "jpg" : targetFormat}`;
-      res.setHeader("Content-Type", targetFormat === "jpeg" ? "image/jpeg" : `image/${targetFormat}`);
+      const outName = `${baseName}_compressed.${ext === "jpeg" ? "jpg" : ext}`;
+      const mime = (ext === "jpg" || ext === "jpeg") ? "image/jpeg" : `image/${ext}`;
+      res.setHeader("Content-Type", mime);
       res.setHeader("Content-Disposition", `attachment; filename="${safeFilename(outName)}"`);
       return res.end(outBuf);
     }
 
-    // PDF compression: attempt light rewrite using pdf-lib (may or may not shrink)
+    // PDF: re-save with pdf-lib (light rewrite, sometimes reduces size)
     if (ext === "pdf") {
       const buf = fs.readFileSync(inputPath);
       const pdfDoc = await PDFDocument.load(buf);
-      // simply re-save (pdf-lib will use some optimizations)
+      // no changes, just re-save using object streams to be slightly more optimized
       const out = await pdfDoc.save({ useObjectStreams: true });
       try { fs.unlinkSync(inputPath); } catch (e) {}
       res.setHeader("Content-Type", "application/pdf");
@@ -591,8 +609,7 @@ app.post("/api/v3/file/compress", upload.single("file"), async (req, res) => {
       return res.end(Buffer.from(out));
     }
 
-    // Fallback: archive into zip (only when we cannot meaningfully compress server-side)
-    // Note: this is last resort; client will receive a zip containing the original file
+    // Fallback (rare): archive original in zip (only when we can't compress)
     const zipName = `${baseName}_compressed.zip`;
     const zipPath = path.join(UPLOAD_DIR, zipName);
     const output = fs.createWriteStream(zipPath);
@@ -600,24 +617,21 @@ app.post("/api/v3/file/compress", upload.single("file"), async (req, res) => {
     archive.pipe(output);
     archive.file(inputPath, { name: originalName });
     await archive.finalize();
-
     output.on("close", () => {
-      // send zip
       res.download(zipPath, zipName, (err) => {
-        // cleanup
         try { fs.unlinkSync(inputPath); } catch (e) {}
         try { fs.unlinkSync(zipPath); } catch (e) {}
         if (err) console.error("[v3/compress] download error:", err);
       });
     });
+
   } catch (err) {
     console.error("[v3/compress] error:", err);
+    try { if (req.file && req.file.path) fs.unlinkSync(req.file.path); } catch (e) {}
     return res.status(500).json({ error: "Compression failed.", details: err.message });
   }
 });
-      
-
-
+  
       
 
 /* ===========================================================
@@ -682,7 +696,7 @@ app.post("/api/v2/zip", upload.array("files"), async (req, res) => {
     archive.pipe(output);
 
     req.files.forEach((file) => archive.file(file.path, { name: file.originalname }));
-    await archive.finalize();
+    await archive.finalize()
 
     output.on("close", () => {
       res.download(zipPath, () => {
