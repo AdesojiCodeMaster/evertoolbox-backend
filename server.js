@@ -371,19 +371,29 @@ if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 // -----------------------------
 const router = express.Router();
 
-// Utility: Delete temp files
+// --- Static folders for downloads ---
+app.use(express.static("converted"));
+app.use(express.static("compressed"));
+
+// --- Ensure directories exist ---
+fs.mkdirSync("uploads", { recursive: true });
+fs.mkdirSync("converted", { recursive: true });
+fs.mkdirSync("compressed", { recursive: true 
+
+// --- Helper cleanup function ---
 const cleanupFile = (filePath) => {
-  fs.unlink(filePath, (err) => {
-    if (err) console.error("Cleanup error:", err);
-  });
+  if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
 };
+
 
 
 // ========================= FILE CONVERTER + COMPRESSOR =========================
 
 
 
-// ========== CONVERT FILE ==========
+// ======================================================
+// ✅ CONVERT FILE
+// ======================================================
 router.post("/convert", upload.single("file"), async (req, res) => {
   try {
     const { outputFormat, watermark, rename } = req.body;
@@ -394,9 +404,8 @@ router.post("/convert", upload.single("file"), async (req, res) => {
     const ext = path.extname(file.originalname).toLowerCase();
     const safeName = sanitizeFilename(rename || `converted_${Date.now()}.${outputFormat}`);
     const outputPath = path.join("converted", safeName);
-    fs.mkdirSync("converted", { recursive: true });
 
-    // Handle TXT → PDF
+    // --- TXT → PDF ---
     if (ext === ".txt" && outputFormat === "pdf") {
       const text = fs.readFileSync(inputPath, "utf8");
       const pdfDoc = await PDFDocument.create();
@@ -406,24 +415,32 @@ router.post("/convert", upload.single("file"), async (req, res) => {
       fs.writeFileSync(outputPath, pdfBytes);
     }
 
-    // Handle DOCX → PDF
+    // --- DOCX → PDF ---
     else if (ext === ".docx" && outputFormat === "pdf") {
       const { value: html } = await mammoth.convertToHtml({ path: inputPath });
+      const text = html.replace(/<[^>]+>/g, "").substring(0, 3000);
       const pdfDoc = await PDFDocument.create();
       const page = pdfDoc.addPage();
-      page.drawText(html.replace(/<[^>]+>/g, "").substring(0, 3000), { x: 50, y: 700, size: 12 });
+      page.drawText(text, { x: 50, y: 700, size: 12 });
       const pdfBytes = await pdfDoc.save();
       fs.writeFileSync(outputPath, pdfBytes);
     }
 
-    // Handle Image Conversion (JPG ↔ PNG)
-    else if ([".jpg", ".jpeg", ".png"].includes(ext)) {
+    // --- Image conversion (JPG ↔ PNG ↔ WEBP) ---
+    else if ([".jpg", ".jpeg", ".png", ".webp"].includes(ext)) {
       await sharp(inputPath).toFormat(outputFormat).toFile(outputPath);
     }
 
-    // Handle PDF → JPG (extract first page)
+    // --- PDF → JPG (first page) ---
     else if (ext === ".pdf" && outputFormat === "jpg") {
-      const converter = pdf2picFromPath(inputPath, { density: 150, saveFilename: "page", savePath: "converted", format: "jpg", width: 800, height: 1000 });
+      const converter = pdf2picFromPath(inputPath, {
+        density: 150,
+        saveFilename: "page",
+        savePath: "converted",
+        format: "jpg",
+        width: 800,
+        height: 1000,
+      });
       await converter(1);
       const newFile = path.join("converted", "page_1.jpg");
       fs.renameSync(newFile, outputPath);
@@ -436,6 +453,7 @@ router.post("/convert", upload.single("file"), async (req, res) => {
 
     cleanupFile(inputPath);
     const fileSize = fs.statSync(outputPath).size;
+
     return res.json({
       message: "Conversion successful",
       downloadUrl: `${req.protocol}://${req.get("host")}/${outputPath}`,
@@ -447,7 +465,9 @@ router.post("/convert", upload.single("file"), async (req, res) => {
   }
 });
 
-// ========== COMPRESS FILE ==========
+// ======================================================
+// ✅ COMPRESS FILE
+// ======================================================
 router.post("/compress", upload.single("file"), async (req, res) => {
   try {
     const file = req.file;
@@ -455,23 +475,29 @@ router.post("/compress", upload.single("file"), async (req, res) => {
 
     const ext = path.extname(file.originalname).toLowerCase();
     const outputPath = path.join("compressed", sanitizeFilename(`compressed_${Date.now()}${ext}`));
-    fs.mkdirSync("compressed", { recursive: true });
 
-    // Compress Images
-    if ([".jpg", ".jpeg", ".png", ".webp"].includes(ext)) {
+    // --- Compress images ---
+    if ([".jpg", ".jpeg"].includes(ext)) {
       await sharp(file.path)
-        .jpeg({ quality: 60 })
-        .png({ quality: 60 })
+        .jpeg({ quality: 55, mozjpeg: true })
+        .toFile(outputPath);
+    } else if (ext === ".png") {
+      await sharp(file.path)
+        .png({ quality: 60, compressionLevel: 9 })
+        .toFile(outputPath);
+    } else if (ext === ".webp") {
+      await sharp(file.path)
+        .webp({ quality: 55 })
         .toFile(outputPath);
     }
 
-    // Compress PDFs
+    // --- Compress PDFs ---
     else if (ext === ".pdf") {
       const pdfBytes = fs.readFileSync(file.path);
       const pdfDoc = await PDFDocument.load(pdfBytes);
       const newPdf = await PDFDocument.create();
       const pages = await newPdf.copyPages(pdfDoc, pdfDoc.getPageIndices());
-      pages.forEach((p) => newPdf.addPage(p));
+      pages.forEach(p => newPdf.addPage(p));
       const compressedBytes = await newPdf.save({ useObjectStreams: true });
       fs.writeFileSync(outputPath, compressedBytes);
     }
@@ -481,9 +507,9 @@ router.post("/compress", upload.single("file"), async (req, res) => {
       return res.status(400).json({ error: "Unsupported file for compression" });
     }
 
-    cleanupFile(file.path);
     const beforeSize = fs.statSync(file.path).size;
     const afterSize = fs.statSync(outputPath).size;
+    cleanupFile(file.path);
 
     return res.json({
       message: "Compression successful",
@@ -497,8 +523,15 @@ router.post("/compress", upload.single("file"), async (req, res) => {
   }
 });
 
-export default router;
-      
+// ======================================================
+// Mount routes and start server
+// ======================================================
+app.use("/", router);
+
+//const PORT = process.env.PORT || 8080;
+//app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+                                       
+
 
 
       
