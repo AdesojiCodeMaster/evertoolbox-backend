@@ -25,7 +25,9 @@
    "child_process": "^1.0.2",
    "fs-extra": "^11.2.0",
    "pdfkit": "^0.13.0",
-    "mammoth": "^1.5.1"
+    "mammoth": "^1.5.1",
+   "pdf2pic": "^3.1.1",
+   "sanitize-filename": "^1.6.3"
    
      },
   "engines": {
