@@ -378,7 +378,7 @@ app.use(express.static("compressed"));
 // --- Ensure directories exist ---
 fs.mkdirSync("uploads", { recursive: true });
 fs.mkdirSync("converted", { recursive: true });
-fs.mkdirSync("compressed", { recursive: true 
+fs.mkdirSync("compressed", { recursive: true });
 
 // --- Helper cleanup function ---
 const cleanupFile = (filePath) => {
