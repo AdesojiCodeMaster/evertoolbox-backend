@@ -1,12 +1,10 @@
 {
-  "renderRebuildTrigger": "4",
   "name": "evertoolbox-backend",
-  "type": "module",
   "version": "1.0.0",
-  "description": "Backend for EverToolbox - SEO, TTS, conversions, image, zip/unzip",
+  "type": "module",
+  "description": "Backend for EverToolbox - conversions, compression, SEO, TTS, and utilities.",
   "main": "server.js",
   "scripts": {
-    "prepare": "rm -rf node_modules/pdf-parse && npm install pdf-parse@1.1.0",
     "start": "node server.js"
   },
   "dependencies": {
@@ -30,10 +28,10 @@
     "mammoth": "^1.5.1",
     "pdf2pic": "^3.1.1",
     "sanitize-filename": "^1.6.3",
-    "pdf-parse": "1.1.0",
-    "docx": "8.5.0"
+    "docx": "8.5.0",
+    "pdfjs-dist": "^4.7.76"
   },
   "engines": {
-    "node": "20.x"
+    "node": ">=16"
   }
 }
