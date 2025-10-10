@@ -38,9 +38,9 @@ import { franc } from 'franc';
 import { fromPath as pdf2picFromPath } from "pdf2pic";
 import sanitizeFilename from "sanitize-filename";
 import { Document, Packer, Paragraph, TextRun } from "docx";
-import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.js";
+import * as pdfjsLib from "pdfjs-dist";
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = null;
+pdfjsLib.GlobalWorkerOptions.workerSrc = require.resolve("pdfjs-dist/build/pdf.worker.js");
 
   
 const __filename = fileURLToPath(import.meta.url);
@@ -447,6 +447,17 @@ async function extractTextFromPdf(filePath) {
   return text.trim();
 }
 
+app.post("/extract-text", upload.single("file"), async (req, res) => {
+  try {
+    const text = await extractTextFromPdf(req.file.path);
+    fs.unlinkSync(req.file.path); // cleanup
+    res.json({ text });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.listen(3000, () => console.log("Server running on port 3000"));
 // ============================
 // 🔤 Create PDF & DOCX from Text
 // ============================
