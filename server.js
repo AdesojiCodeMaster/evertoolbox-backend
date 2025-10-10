@@ -414,21 +414,7 @@ function makeDownloadUrl(req, filePath) {
   return `${req.protocol}://${req.get("host")}/${rel}`;
 }
 
-// =========================
-// ✅ PDF Extract Helper
-// =========================
-async function extractTextFromPdf(filePath) {
-  const data = new Uint8Array(fs.readFileSync(filePath));
-  const pdfDoc = await pdfjsLib.getDocument({ data }).promise;
 
-  let text = "";
-  for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum++) {
-    const page = await pdfDoc.getPage(pageNum);
-    const content = await page.getTextContent();
-    text += content.items.map(item => item.str).join(" ") + "\n";
-  }
-  return text.trim();
-}
 
 // =========================
 // ✅ Example Route
