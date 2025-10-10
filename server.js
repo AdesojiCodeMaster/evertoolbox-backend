@@ -39,7 +39,11 @@ import { fromPath as pdf2picFromPath } from "pdf2pic";
 import sanitizeFilename from "sanitize-filename";
 import pdfParse from "pdf-parse";
 import { Document, Packer, Paragraph, TextRun } from "docx";
+import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.js";
 
+pdfjsLib.GlobalWorkerOptions.workerSrc = null;
+
+  
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
@@ -394,6 +398,36 @@ app.use("/compressed", express.static(COMPRESSED));
 const cleanup = (p) => {
   try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch (e) { /* ignore */ }
 };
+
+// =========================
+// ✅ PDF Extract Helper
+// =========================
+async function extractTextFromPdf(filePath) {
+  const data = new Uint8Array(fs.readFileSync(filePath));
+  const pdfDoc = await pdfjsLib.getDocument({ data }).promise;
+
+  let text = "";
+  for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum++) {
+    const page = await pdfDoc.getPage(pageNum);
+    const content = await page.getTextContent();
+    text += content.items.map(item => item.str).join(" ") + "\n";
+  }
+  return text.trim();
+}
+
+// =========================
+// ✅ Example Route
+// =========================
+app.post("/upload-pdf", upload.single("file"), async (req, res) => {
+  try {
+    const text = await extractTextFromPdf(req.file.path);
+    res.json({ text });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to process PDF" });
+  }
+});
+
 
 // ========================= FILE CONVERTER + COMPRESSOR =========================
 
