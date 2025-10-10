@@ -3,8 +3,9 @@
   "version": "1.0.0",
   "description": "Backend for EverToolbox - SEO, TTS, conversions, image, zip/unzip",
   "main": "server.js",
+  "type": "commonjs",
   "scripts": {
-    "start": "node server.js"
+  "start": "node server.js"
   },
   "dependencies": {
     "archiver": "^5.3.1",
