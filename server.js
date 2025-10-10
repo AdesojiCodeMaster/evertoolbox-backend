@@ -17,6 +17,19 @@ const googleTTS = require('google-tts-api'); // generate base64 audio
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 
+
+
+    //routes/filetools_v5.js for Converter+ Compressor 
+//==========================≈======================≠==========
+//import filetoolsV5 from './routes/filetools_v5.js';
+//app.use('/api/tools/file', filetoolsV5);
+
+const filetoolsV5 = require('./routes/filetools_v5.js');
+app.use('/api/tools/file', filetoolsV5);
+
+//=====≈=====================================================≈=
+
+
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '200kb' }));
@@ -318,15 +331,6 @@ app.get('/api/temp/:id/:filename', (req, res) => {
 });
 
 
-    //routes/filetools_v5.js for Converter+ Compressor 
-//==========================≈======================≠==========
-//import filetoolsV5 from './routes/filetools_v5.js';
-//app.use('/api/tools/file', filetoolsV5);
-
-const filetoolsV5 = require('./routes/filetools_v5.js');
-app.use('/api/tools/file', filetoolsV5);
-
-//=====≈=====================================================≈=
 
 
 // --------------------
