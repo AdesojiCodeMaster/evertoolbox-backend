@@ -51,15 +51,25 @@ Testing checklist
 ==================================================================
 */
 
-import express from 'express';
-import multer from 'multer';
-import { fileURLToPath } from 'url';
-import path from 'path';
-import mime from 'mime-types';
-import sanitize from 'sanitize-filename';
-import tmp from 'tmp-promise';
-import fs from 'fs/promises';
-import { spawn } from 'child_process';
+//import express from 'express';
+//import multer from 'multer';
+//import { fileURLToPath } from 'url';
+//import path from 'path';
+//import mime from 'mime-types';
+//import sanitize from 'sanitize-filename';
+//import tmp from 'tmp-promise';
+//import fs from 'fs/promises';
+//import { spawn } from 'child_process';
+
+const express = require('express');
+const multer = require('multer');
+const fs = require('fs');
+const path = require('path');
+const { exec } = require('child_process');
+const mime = require('mime-types');
+const sanitizeFilename = require('sanitize-filename');
+const tmp = require('tmp-promise');
+
 
 const router = express.Router();
 const __filename = fileURLToPath(import.meta.url);
@@ -323,4 +333,5 @@ router.post('/convert', upload.single('file'), async (req, res) => {
 // A small health endpoint for the router
 router.get('/health', (req, res) => res.json({ ok: true, activeProcesses }));
 
-export default router;
+module.exports = router;
+
