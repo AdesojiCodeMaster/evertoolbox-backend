@@ -384,20 +384,35 @@ const router = express.Router();
 
 // --- Ensure directories exist 
 // Directories
-const UPLOADS = path.join(__dirname, "uploads");
+//const UPLOADS = path.join(__dirname, "uploads");
+//const CONVERTED = path.join(__dirname, "converted");
+//const COMPRESSED = path.join(__dirname, "compressed");
+//fs.mkdirSync(UPLOADS, { recursive: true });
+//fs.mkdirSync(CONVERTED, { recursive: true });
+//fs.mkdirSync(COMPRESSED, { recursive: true });
+
+//app.use("/converted", express.static(CONVERTED));
+//app.use("/compressed", express.static(COMPRESSED));
+// ============================
+// 📂 Directory setup
+// ============================
+const UPLOAD_DIR = path.join(__dirname, "uploads");
 const CONVERTED = path.join(__dirname, "converted");
 const COMPRESSED = path.join(__dirname, "compressed");
-fs.mkdirSync(UPLOADS, { recursive: true });
-fs.mkdirSync(CONVERTED, { recursive: true });
-fs.mkdirSync(COMPRESSED, { recursive: true });
+[UPLOAD_DIR, CONVERTED, COMPRESSED].forEach(d => fs.mkdirSync(d, { recursive: true }));
 
-app.use("/converted", express.static(CONVERTED));
-app.use("/compressed", express.static(COMPRESSED));
 // --- Helper cleanup function ---
-// Helpers
+// ============================
+// 🧹 Helpers
+// ============================
 const cleanup = (p) => {
-  try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch (e) { /* ignore */ }
+  try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch (_) {}
 };
+
+function makeDownloadUrl(req, filePath) {
+  const rel = path.relative(__dirname, filePath).replace(/\\/g, "/");
+  return `${req.protocol}://${req.get("host")}/${rel}`;
+}
 
 // =========================
 // ✅ PDF Extract Helper
@@ -431,19 +446,29 @@ app.post("/upload-pdf", upload.single("file"), async (req, res) => {
 
 // ========================= FILE CONVERTER + COMPRESSOR =========================
 
+// ============================
+// 🧠 PDF Text Extractor (pdfjs-dist)
+// ============================
+async function extractTextFromPdf(filePath) {
+  const data = new Uint8Array(fs.readFileSync(filePath));
+  const pdfDoc = await pdfjsLib.getDocument({ data }).promise;
 
-function makeDownloadUrl(req, filePath) {
-  const rel = path.relative(__dirname, filePath).replace(/\\/g, "/");
-  if (rel.startsWith("converted/")) return `${req.protocol}://${req.get("host")}/${rel}`;
-  if (rel.startsWith("compressed/")) return `${req.protocol}://${req.get("host")}/${rel}`;
-  return `${req.protocol}://${req.get("host")}/${rel}`;
+  let text = "";
+  for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum++) {
+    const page = await pdfDoc.getPage(pageNum);
+    const content = await page.getTextContent();
+    text += content.items.map((i) => i.str).join(" ") + "\n";
+  }
+  return text.trim();
 }
 
+// ============================
+// 🔤 Create PDF & DOCX from Text
+// ============================
 async function makePdfFromText(text, outPath) {
   const doc = await PDFDocument.create();
   const font = await doc.embedFont(StandardFonts.Helvetica);
   const pageWidth = 612, pageHeight = 792, margin = 48, lineHeight = 14, maxChars = 90;
-
   const words = text.replace(/\r/g, "").split(/\s+/);
   const lines = [];
   let cur = "";
@@ -454,7 +479,6 @@ async function makePdfFromText(text, outPath) {
     } else cur = (cur + " " + w).trim();
   }
   if (cur) lines.push(cur);
-
   let i = 0;
   while (i < lines.length) {
     const page = doc.addPage([pageWidth, pageHeight]);
@@ -465,17 +489,12 @@ async function makePdfFromText(text, outPath) {
       i++;
     }
   }
-
-  const bytes = await doc.save();
-  fs.writeFileSync(outPath, bytes);
+  fs.writeFileSync(outPath, await doc.save());
 }
 
 async function makeDocxFromText(text, outPath) {
-  const doc = new Document();
-  const paragraphs = text.split(/\n+/).map(
-    (p) => new Paragraph({ children: [new TextRun(p)] })
-  );
-  doc.addSection({ children: paragraphs });
+  const paragraphs = text.split(/\n+/).map(p => new Paragraph({ children: [new TextRun(p)] }));
+  const doc = new Document({ sections: [{ children: paragraphs }] });
   const buffer = await Packer.toBuffer(doc);
   fs.writeFileSync(outPath, buffer);
 }
@@ -485,46 +504,33 @@ async function makePdfFromImage(imagePath, outPath) {
   const pdfDoc = await PDFDocument.create();
   const ext = path.extname(imagePath).toLowerCase();
   let embedded;
-  if (ext === ".jpg" || ext === ".jpeg") {
-    embedded = await pdfDoc.embedJpg(imgBuf);
-  } else {
-    const pngBuf = await sharp(imgBuf).png().toBuffer();
-    embedded = await pdfDoc.embedPng(pngBuf);
-  }
+  if (ext === ".jpg" || ext === ".jpeg") embedded = await pdfDoc.embedJpg(imgBuf);
+  else embedded = await pdfDoc.embedPng(await sharp(imgBuf).png().toBuffer());
   const page = pdfDoc.addPage([embedded.width, embedded.height]);
   page.drawImage(embedded, { x: 0, y: 0, width: embedded.width, height: embedded.height });
-  const out = await pdfDoc.save();
-  fs.writeFileSync(outPath, out);
+  fs.writeFileSync(outPath, await pdfDoc.save());
 }
 
-// ======================================================
-// Root
-// ======================================================
-app.get("/", (req, res) => {
-  res.send("✅ EverToolbox Backend running on Render");
-});
+// ============================
+// 🧾 Routes
+// ============================
+app.get("/", (req, res) => res.send("✅ EverToolbox Backend running on Render"));
 
-// ======================================================
-// CONVERT route
-// ======================================================
+// ---- Convert ----
 app.post("/convert", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-    const outputFormatRaw = (req.body.outputFormat || "").toString().replace(/^\./, "").toLowerCase();
-    const watermark = (req.body.watermark || "").toString();
-    const rename = (req.body.rename || "").toString();
+
+    const { outputFormat = "", watermark = "", rename = "" } = req.body;
     const inputPath = req.file.path;
-    const originalName = req.file.originalname || "file";
+    const originalName = req.file.originalname;
     const inputExt = path.extname(originalName).toLowerCase();
     const baseName = path.basename(originalName, inputExt);
-
-    const finalExt = outputFormatRaw || inputExt.replace(/^\./, "");
-    const outFilename = sanitizeFilename(
-      rename && rename.trim() ? rename : `${baseName}_converted.${finalExt}`
-    );
+    const finalExt = outputFormat.replace(/^\./, "").toLowerCase() || inputExt.replace(/^\./, "");
+    const outFilename = sanitizeFilename(rename?.trim() || `${baseName}_converted.${finalExt}`);
     const outPath = path.join(CONVERTED, outFilename);
 
-    // ---------- TXT ----------
+    // ---- TXT ----
     if (inputExt === ".txt") {
       const txt = fs.readFileSync(inputPath, "utf8");
       if (finalExt === "pdf") await makePdfFromText(txt, outPath);
@@ -533,50 +539,11 @@ app.post("/convert", upload.single("file"), async (req, res) => {
       else throw new Error(`TXT → ${finalExt} not supported`);
     }
 
-    // ---------- DOCX ----------
-    else if (inputExt === ".docx") {
-      if (finalExt === "txt") {
-        const { value } = await mammoth.extractRawText({ path: inputPath });
-        fs.writeFileSync(outPath, value || "", "utf8");
-      } else if (finalExt === "pdf") {
-        const { value: html } = await mammoth.convertToHtml({ path: inputPath });
-        const text = html.replace(/<[^>]+>/g, "\n").trim();
-        await makePdfFromText(text.substring(0, 20000), outPath);
-      } else if (["jpg", "jpeg", "png", "webp"].includes(finalExt)) {
-        const tempPdf = path.join(UPLOADS, `${baseName}_tmp.pdf`);
-        const { value: html } = await mammoth.convertToHtml({ path: inputPath });
-        const text = html.replace(/<[^>]+>/g, "\n").substring(0, 20000);
-        await makePdfFromText(text, tempPdf);
-        const converter = pdf2picFromPath(tempPdf, {
-          density: 150,
-          saveFilename: "page",
-          savePath: CONVERTED,
-          format: finalExt,
-          width: 1200,
-        });
-        await converter(1);
-        fs.renameSync(path.join(CONVERTED, `page_1.${finalExt}`), outPath);
-        cleanup(tempPdf);
-      } else if (finalExt === "docx") {
-        fs.copyFileSync(inputPath, outPath);
-      } else throw new Error(`DOCX → ${finalExt} not supported`);
-    }
-
-    // ---------- IMAGE ----------
-    else if ([".jpg", ".jpeg", ".png", ".webp"].includes(inputExt)) {
-      if (finalExt === "pdf") await makePdfFromImage(inputPath, outPath);
-      else if (["jpg", "jpeg", "png", "webp"].includes(finalExt)) {
-        const fmt = finalExt === "jpg" ? "jpeg" : finalExt;
-        await sharp(inputPath).toFormat(fmt).toFile(outPath);
-      } else throw new Error(`Image → ${finalExt} not supported`);
-    }
-
-    // ---------- PDF ----------
+    // ---- PDF ----
     else if (inputExt === ".pdf") {
       if (finalExt === "txt") {
-        const data = fs.readFileSync(inputPath);
-        const parsed = await pdfParse(data);
-        fs.writeFileSync(outPath, parsed.text || "", "utf8");
+        const text = await extractTextFromPdf(inputPath);
+        fs.writeFileSync(outPath, text, "utf8");
       } else if (["jpg", "jpeg", "png", "webp"].includes(finalExt)) {
         const converter = pdf2picFromPath(inputPath, {
           density: 150,
@@ -590,9 +557,8 @@ app.post("/convert", upload.single("file"), async (req, res) => {
       } else if (finalExt === "pdf") {
         if (watermark) {
           const pdfDoc = await PDFDocument.load(fs.readFileSync(inputPath));
-          const pages = pdfDoc.getPages();
           const helvetica = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-          pages.forEach((page) => {
+          pdfDoc.getPages().forEach((page) => {
             const { width, height } = page.getSize();
             page.drawText(String(watermark), {
               x: width / 2 - 100,
@@ -608,24 +574,34 @@ app.post("/convert", upload.single("file"), async (req, res) => {
       } else throw new Error(`PDF → ${finalExt} not supported`);
     }
 
+    // ---- Image ----
+    else if ([".jpg", ".jpeg", ".png", ".webp"].includes(inputExt)) {
+      if (finalExt === "pdf") await makePdfFromImage(inputPath, outPath);
+      else if (["jpg", "jpeg", "png", "webp"].includes(finalExt))
+        await sharp(inputPath).toFormat(finalExt === "jpg" ? "jpeg" : finalExt).toFile(outPath);
+      else throw new Error(`Image → ${finalExt} not supported`);
+    }
+
+    // ---- Unsupported ----
     else throw new Error(`Input type ${inputExt} not supported`);
 
     cleanup(inputPath);
-    const fileSize = fs.statSync(outPath).size;
-    res.json({ message: "Conversion successful", downloadUrl: makeDownloadUrl(req, outPath), fileSize });
+    res.json({
+      message: "Conversion successful",
+      downloadUrl: makeDownloadUrl(req, outPath),
+      fileSize: fs.statSync(outPath).size,
+    });
   } catch (err) {
     console.error("convert error:", err);
-    if (req.file?.path) cleanup(req.file.path);
     res.status(500).json({ error: "Conversion failed", details: err.message });
   }
 });
 
-// ======================================================
-// COMPRESS route
-// ======================================================
+// ---- Compress ----
 app.post("/compress", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+
     const inputPath = req.file.path;
     const originalName = req.file.originalname;
     const inputExt = path.extname(originalName).toLowerCase();
@@ -634,7 +610,10 @@ app.post("/compress", upload.single("file"), async (req, res) => {
     const outPath = path.join(COMPRESSED, outFilename);
 
     if ([".jpg", ".jpeg", ".png", ".webp"].includes(inputExt)) {
-      await sharp(inputPath).resize({ width: 1920, withoutEnlargement: true }).jpeg({ quality: 70 }).toFile(outPath);
+      await sharp(inputPath)
+        .resize({ width: 1920, withoutEnlargement: true })
+        .jpeg({ quality: 70 })
+        .toFile(outPath);
     } else if ([".txt", ".docx"].includes(inputExt)) {
       const zipPath = path.join(COMPRESSED, `${baseName}.zip`);
       const output = fs.createWriteStream(zipPath);
@@ -643,26 +622,28 @@ app.post("/compress", upload.single("file"), async (req, res) => {
       archive.file(inputPath, { name: originalName });
       await archive.finalize();
       cleanup(inputPath);
-      return res.json({ message: "Compression successful", downloadUrl: makeDownloadUrl(req, zipPath), fileSize: fs.statSync(zipPath).size });
+      return res.json({
+        message: "Compression successful",
+        downloadUrl: makeDownloadUrl(req, zipPath),
+        fileSize: fs.statSync(zipPath).size,
+      });
     } else if (inputExt === ".pdf") {
       const pdfDoc = await PDFDocument.load(fs.readFileSync(inputPath));
       fs.writeFileSync(outPath, await pdfDoc.save({ useObjectStreams: true }));
     } else throw new Error(`Compression not supported for ${inputExt}`);
 
     cleanup(inputPath);
-    res.json({ message: "Compression successful", downloadUrl: makeDownloadUrl(req, outPath), fileSize: fs.statSync(outPath).size });
+    res.json({
+      message: "Compression successful",
+      downloadUrl: makeDownloadUrl(req, outPath),
+      fileSize: fs.statSync(outPath).size,
+    });
   } catch (err) {
     console.error("compress error:", err);
     res.status(500).json({ error: "Compression failed", details: err.message });
   }
 });
-
-// ======================================================
-// Start server
-// ======================================================
-//const PORT = process.env.PORT || 5000;
-//app.listen(PORT, () => console.log(`🚀 EverToolbox backend running on port ${PORT}`));
-
+  
 
 /* ===========================================================
    2. IMAGE CONVERTER / THUMBNAIL GENERATOR
