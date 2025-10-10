@@ -1,11 +1,12 @@
 {
-  "renderRebuildTrigger": "3",
+  "renderRebuildTrigger": "4",
   "name": "evertoolbox-backend",
   "type": "module",
   "version": "1.0.0",
   "description": "Backend for EverToolbox - SEO, TTS, conversions, image, zip/unzip",
   "main": "server.js",
   "scripts": {
+    "prepare": "rm -rf node_modules/pdf-parse && npm install pdf-parse@1.1.0",
     "start": "node server.js"
   },
   "dependencies": {
