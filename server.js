@@ -396,7 +396,7 @@ const router = express.Router();
 // ============================
 // 📂 Directory setup
 // ============================
-const UPLOAD_DIR = path.join(__dirname, "uploads");
+//const UPLOAD_DIR = path.join(__dirname, "uploads");
 const CONVERTED = path.join(__dirname, "converted");
 const COMPRESSED = path.join(__dirname, "compressed");
 [UPLOAD_DIR, CONVERTED, COMPRESSED].forEach(d => fs.mkdirSync(d, { recursive: true }));
