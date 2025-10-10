@@ -37,7 +37,6 @@ import { v4 as uuidv4 } from "uuid";
 import { franc } from 'franc';
 import { fromPath as pdf2picFromPath } from "pdf2pic";
 import sanitizeFilename from "sanitize-filename";
-import pdfParse from "pdf-parse";
 import { Document, Packer, Paragraph, TextRun } from "docx";
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.js";
 
