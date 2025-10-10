@@ -1,37 +1,25 @@
-{
+  {
   "name": "evertoolbox-backend",
   "version": "1.0.0",
   "description": "Backend for EverToolbox - SEO, TTS, conversions, image, zip/unzip",
-  "type": "module",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "adm-zip": "^0.5.12",
-    "archiver": "^6.0.2",
+    "archiver": "^5.3.1",
     "cheerio": "^1.0.0-rc.12",
-    "child_process": "^1.0.2",
     "cors": "^2.8.5",
-    "docx": "^8.5.0",
     "express": "^4.18.2",
-    "formidable": "^3.5.1",
-    "franc": "^6.1.0",
-    "fs-extra": "^11.2.0",
     "google-tts-api": "^2.0.2",
-    "mammoth": "^1.5.1",
     "multer": "^1.4.5-lts.1",
     "node-fetch": "^2.6.1",
-    "pdf-lib": "^1.17.1",
-    "pdf2pic": "^3.1.1",
-    "pdfkit": "^0.13.0",
-    "pdfjs-dist": "^4.4.168",
-    "sanitize-filename": "^1.6.3",
-    "sharp": "^0.33.3",
+    "sharp": "^0.32.1",
     "unzipper": "^0.10.11",
-    "uuid": "^9.0.0"
-  },
+    "uuid": "^9.0.0",
+    "franc": "^6.1.0"
+     },
   "engines": {
-    "node": ">=18"
+    "node": ">=16"
   }
-}
+  }
