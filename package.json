@@ -17,7 +17,10 @@
     "sharp": "^0.32.1",
     "unzipper": "^0.10.11",
     "uuid": "^9.0.0",
-    "franc": "^6.1.0"
+    "franc": "^6.1.0",
+    "mime-types": "^2.1.35",
+    "sanitize-filename": "^1.6.3",
+    "tmp-promise": "^3.0.2",
      },
   "engines": {
     "node": ">=16"
