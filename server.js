@@ -320,8 +320,12 @@ app.get('/api/temp/:id/:filename', (req, res) => {
 
     //routes/filetools_v5.js for Converter+ Compressor 
 //==========================≈======================≠==========
-import filetoolsV5 from './routes/filetools_v5.js';
+//import filetoolsV5 from './routes/filetools_v5.js';
+//app.use('/api/tools/file', filetoolsV5);
+
+const filetoolsV5 = require('./routes/filetools_v5.js');
 app.use('/api/tools/file', filetoolsV5);
+
 //=====≈=====================================================≈=
 
 
