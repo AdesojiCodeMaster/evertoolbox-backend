@@ -19,6 +19,10 @@ const { v4: uuidv4 } = require('uuid');
 
 
 
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '200kb' }));
+
     //routes/filetools_v5.js for Converter+ Compressor 
 //==========================≈======================≠==========
 //import filetoolsV5 from './routes/filetools_v5.js';
@@ -29,10 +33,6 @@ app.use('/api/tools/file', filetoolsV5);
 
 //=====≈=====================================================≈=
 
-
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: '200kb' }));
 
 // storage
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
