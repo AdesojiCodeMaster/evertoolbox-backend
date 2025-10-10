@@ -84,62 +84,54 @@ app.get('/api/seo-analyze', async (req, res) => {
 // --- TTS endpoint with translation + speech ---
 // Place this near other routes in your server.js
 
-const fetch = require('node-fetch');   // already available in most Node 18+ environments
+
 const { franc } = require('franc');
-const googleTTS = require('google-tts-api');
-
-app.post('/api/tts', async (req, res) => {
+// ====== TTS Handler (OpenAI + Google fallback) ======
+   
+ app.post('/api/tts', async (req, res) => {
   try {
-    const { text, lang } = req.body || {};
-    if (!text) return res.status(400).json({ error: 'Missing text' });
+    const { text, lang } = req.body;
+    if (!text || !lang) {
+      return res.status(400).json({ error: 'Missing text or lang' });
+    }
 
-    // Target language (from user selection)
-    const targetLang = (lang || 'en').split('-')[0].toLowerCase();
+    // Step 1: Translate text to target language using Google Translate endpoint
+    const translateUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(lang)}&dt=t&q=${encodeURIComponent(text)}`;
+    const translateResp = await fetch(translateUrl);
+    const translateData = await translateResp.json();
 
-    // Detect source language
-    const detected = franc(text);
-    const sourceLang = detected && detected !== 'und' ? detected : 'auto';
+    const translatedText = translateData[0]?.map(x => x[0]).join(' ');
+    if (!translatedText) {
+      return res.status(500).json({ error: 'Translation failed' });
+    }
 
-    console.log(`Translating from ${sourceLang} → ${targetLang}`);
+    console.log(`Translated to [${lang}]:`, translatedText);
 
-    // 1️⃣ Translate text
-    // Use Google Translate free endpoint
-    const transURL = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sourceLang}&tl=${targetLang}&dt=t&q=${encodeURIComponent(
-      text
-    )}`;
-    const transResp = await fetch(transURL);
-    const transJson = await transResp.json();
-
-    // Extract translated text
-    const translated =
-      (transJson && transJson[0] && transJson[0].map((t) => t[0]).join('')) ||
-      text;
-
-    console.log('Translated text:', translated);
-
-    // 2️⃣ Generate speech
-    const ttsUrl = googleTTS.getAudioUrl(translated, {
-      lang: targetLang,
+    // Step 2: Generate TTS from translated text
+    const googleTTS = await import('google-tts-api');
+    const url = googleTTS.getAudioUrl(translatedText, {
+      lang,
       slow: false,
       host: 'https://translate.google.com',
     });
 
-    // 3️⃣ Fetch the MP3 and send as download
-    const audioResp = await fetch(ttsUrl);
-    const arrayBuffer = await audioResp.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
+    // Step 3: Fetch MP3 and send it back
+    const audioResp = await fetch(url);
+    const audioBuf = await audioResp.arrayBuffer();
 
     res.set({
       'Content-Type': 'audio/mpeg',
       'Content-Disposition': 'attachment; filename="speech.mp3"',
     });
-    res.send(buffer);
+    res.send(Buffer.from(audioBuf));
   } catch (err) {
     console.error('TTS error:', err);
-    res.status(500).json({ error: 'TTS failed: ' + err.message });
+    res.status(500).json({ error: 'TTS generation failed' });
   }
 });
-  
+      
+
+
 
 
 // --------------------
@@ -323,6 +315,7 @@ app.get('/api/temp/:id/:filename', (req, res) => {
     // optionally: delete after download -- we won't auto-delete to avoid race conditions
   });
 });
+
 
 // --------------------
 // Start server
