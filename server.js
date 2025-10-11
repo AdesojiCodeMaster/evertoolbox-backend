@@ -321,7 +321,7 @@ app.get('/api/temp/:id/:filename', (req, res) => {
 
 
 //=======≈===========≈===============================≈
-import { attachFileTool } from "./filetool_loader.js";
+const { attachFileTool } = require("./filetool_loader.js");
 attachFileTool(app);
 //======================================================
 
