@@ -24,7 +24,7 @@
     "tmp-promise": "^3.0.2",
     "file-type": "^18.0.0",
     "express-rate-limit": "^6.10.0",
-    "libreoffice-convert": "^1.0.0",   
+    "libreoffice-convert": "^1.0.0"
      },
   "engines": {
     "node": ">=16"
