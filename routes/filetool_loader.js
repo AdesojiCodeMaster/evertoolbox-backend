@@ -1,6 +1,6 @@
-import fileRouter from "./routes/filetools_v5.js";
+const fileRouter = require("./routes/filetools_v5.js");
 
-export function attachFileTool(app) {
+function attachFileTool(app) {
   try {
     app.use("/api/tools/file", fileRouter);
     console.log("✅ File Converter & Compressor tool loaded");
@@ -8,3 +8,5 @@ export function attachFileTool(app) {
     console.error("⚠️ Failed to load File Converter Tool:", err);
   }
 }
+
+module.exports = { attachFileTool };
