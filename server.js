@@ -23,17 +23,6 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '200kb' }));
 
-    //routes/filetools_v5.js for Converter+ Compressor 
-//==========================≈======================≠==========
-//import filetoolsV5 from './routes/filetools_v5.js';
-//app.use('/api/tools/file', filetoolsV5);
-
-//const filetoolsV5 = require('./routes/filetools_v5.js');
-//app.use('/api/tools/file', filetoolsV5);
-
-//=====≈=====================================================≈=
-
-
 // storage
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -331,6 +320,10 @@ app.get('/api/temp/:id/:filename', (req, res) => {
 });
 
 
+//=======≈===========≈===============================≈
+import { attachFileTool } from "./filetool_loader.js";
+attachFileTool(app);
+//======================================================
 
 
 // --------------------
