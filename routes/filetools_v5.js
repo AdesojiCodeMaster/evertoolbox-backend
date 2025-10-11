@@ -1,13 +1,6 @@
 // routes/filetools_v5.js
-// CommonJS, Render-friendly router implementing a single-file Converter + Compressor
-// - Single upload only
-// - Rejects same-format conversion
-// - True compression for images (sharp), PDFs (ghostscript), audio (ffmpeg) when available
-// - Lazy-loads heavy modules only when needed
-// - Uses tmp-promise for secure temp dirs and auto cleanup
-// - Returns direct download (no zip), deletes temp files after download
-// - Accepts these form-data fields: file (file), targetFormat (string), quality (0-100), width, height, edits (JSON string)
-// - Mount path recommended: app.use('/api/tools/file', filetoolsV5)
+// CommonJS router: extended Converter + Compressor including text and docx handling.
+// Paste and replace your current routes/filetools_v5.js with this file.
 
 const express = require('express');
 const multer = require('multer');
@@ -17,131 +10,140 @@ const tmp = require('tmp-promise');
 const fs = require('fs/promises');
 const fsSync = require('fs');
 const mime = require('mime-types');
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
+const zlib = require('zlib');
+const { pipeline } = require('stream/promises');
 
 const router = express.Router();
 
-// Config (change via env vars as needed)
-const MAX_FILE_SIZE_BYTES = parseInt(process.env.MAX_FILE_SIZE_BYTES || '83886080'); // 80MB default
+// Config
+const MAX_FILE_SIZE_BYTES = parseInt(process.env.MAX_FILE_SIZE_BYTES || '83886080'); // 80MB
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT_PROCESSES || '2');
 
-// Simple semaphore
 let active = 0;
 async function acquire() {
-  while (active >= MAX_CONCURRENT) {
-    await new Promise(r => setTimeout(r, 120));
-  }
+  while (active >= MAX_CONCURRENT) await new Promise(r => setTimeout(r, 120));
   active++;
 }
 function release() { active = Math.max(0, active - 1); }
 
-// Multer: store into a dedicated temporary folder per-request for safety
+// Multer: per-request temp dir
 const storage = multer.diskStorage({
   destination: async (req, file, cb) => {
     try {
       const dir = await tmp.dir({ unsafeCleanup: true });
-      req._tmpDir = dir; // store handle for cleanup
+      req._tmpDir = dir;
       cb(null, dir.path);
-    } catch (e) {
-      cb(e);
-    }
+    } catch (e) { cb(e); }
   },
-  filename: (req, file, cb) => {
-    cb(null, `${Date.now()}-${sanitize(file.originalname || 'upload')}`);
-  }
+  filename: (req, file, cb) => cb(null, `${Date.now()}-${sanitize(file.originalname || 'upload')}`)
 });
 const upload = multer({ storage, limits: { fileSize: MAX_FILE_SIZE_BYTES } });
 
-// Helper: cleanup temp dir if present
+// helpers
 async function cleanupTmp(req) {
-  try {
-    if (req && req._tmpDir && req._tmpDir.cleanup) await req._tmpDir.cleanup();
-  } catch (e) { /* ignore */ }
+  try { if (req && req._tmpDir && req._tmpDir.cleanup) await req._tmpDir.cleanup(); } catch (e) {}
 }
-
-// Lightweight SVG safety check
-async function isSvgSafe(filePath) {
+async function isSvgSafe(fp) {
   try {
-    const txt = await fs.readFile(filePath, 'utf8');
+    const txt = await fs.readFile(fp, 'utf8');
     const lower = txt.toLowerCase();
     if (lower.includes('<script') || lower.includes('javascript:') || lower.includes('onload=') || lower.includes('xlink:href')) return false;
     return true;
-  } catch (e) {
-    return false;
-  }
+  } catch (e) { return false; }
 }
-
-// Lazy loaders
-function lazySharp() {
-  try { return require('sharp'); } catch (e) { throw new Error('sharp module not installed on server'); }
+function commandExists(cmd) {
+  try { const out = execSync(`which ${cmd}`, { stdio: ['ignore','pipe','ignore'] }).toString().trim(); return !!out; } catch (e) { return false; }
 }
-function ensureCommandExists(cmd) {
-  // returns true/false depending on whether command is available (sync)
-  try { const which = require('child_process').execSync(`which ${cmd}`, { stdio: 'pipe' }).toString().trim(); return !!which; } catch (e) { return false; }
-}
-
-// Run shell command and await finish (returns stdout)
 function runCmd(cmd, args = []) {
   return new Promise((resolve, reject) => {
     const ps = spawn(cmd, args);
-    let stderr = '';
-    let stdout = '';
-    ps.stdout.on('data', d => { stdout += d.toString(); });
-    ps.stderr.on('data', d => { stderr += d.toString(); });
-    ps.on('error', err => reject(err));
+    let stderr = '', stdout = '';
+    ps.stdout.on('data', d => stdout += d.toString());
+    ps.stderr.on('data', d => stderr += d.toString());
+    ps.on('error', e => reject(e));
     ps.on('close', code => code === 0 ? resolve(stdout) : reject(new Error(stderr || `Exit ${code}`)));
   });
 }
 
-// Main endpoint: POST /process
-// Accepts form-data with single file only
+// Libreoffice convert helper (lazy)
+async function libreConvertBuffer(buf, toExt) {
+  let libre;
+  try { libre = require('libreoffice-convert'); } catch (e) { throw new Error('libreoffice-convert npm module not installed'); }
+  return new Promise((resolve, reject) => {
+    libre.convert(buf, `.${toExt}`, undefined, (err, done) => {
+      if (err) return reject(err);
+      resolve(done);
+    });
+  });
+}
+
+// gzip / brotli compression helpers
+async function compressGzip(inputPath, outPath) {
+  const source = fsSync.createReadStream(inputPath);
+  const dest = fsSync.createWriteStream(outPath);
+  const gzip = zlib.createGzip({ level: 9 });
+  await pipeline(source, gzip, dest);
+}
+async function compressBrotli(inputPath, outPath) {
+  const source = fsSync.createReadStream(inputPath);
+  const dest = fsSync.createWriteStream(outPath);
+  const bro = zlib.createBrotliCompress({
+    params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 11 }
+  });
+  await pipeline(source, bro, dest);
+}
+
+// health
+router.get('/health', (req, res) => res.json({ status: 'ok', tool: 'filetools_v5', activeProcesses: active }));
+
+// Main: POST /process
 router.post('/process', upload.single('file'), async (req, res) => {
-  // Defensive checks
   if (!req.file) { await cleanupTmp(req); return res.status(400).json({ error: 'No file uploaded' }); }
   if (Array.isArray(req.files) && req.files.length > 1) { await cleanupTmp(req); return res.status(400).json({ error: 'Only one file allowed' }); }
 
-  // parse params
-  const targetFormatRaw = (req.body.targetFormat || '').trim().toLowerCase();
-  const quality = Math.max(1, Math.min(100, parseInt(req.body.quality || '80'))); // 1..100
+  const targetRaw = (req.body.targetFormat || '').toLowerCase().trim();
+  const quality = Math.max(1, Math.min(100, parseInt(req.body.quality || '80')));
   const width = req.body.width ? parseInt(req.body.width) : null;
   const height = req.body.height ? parseInt(req.body.height) : null;
   let edits = null;
-  try { if (req.body.edits) edits = JSON.parse(req.body.edits); } catch (e) { /* ignore */ }
+  try { if (req.body.edits) edits = JSON.parse(req.body.edits); } catch (e) {}
 
   const inputPath = req.file.path;
   const originalName = sanitize(req.file.originalname || 'file');
   const inputExt = path.extname(originalName).replace('.', '').toLowerCase();
-  const baseName = path.basename(originalName, path.extname(originalName));
+  const base = path.basename(originalName, path.extname(originalName));
 
-  // target required
-  if (!targetFormatRaw) { await cleanupTmp(req); return res.status(400).json({ error: 'targetFormat is required' }); }
+  if (!targetRaw) { await cleanupTmp(req); return res.status(400).json({ error: 'targetFormat required' }); }
 
-  // same-format detection
-  if (inputExt === targetFormatRaw) { await cleanupTmp(req); return res.status(400).json({ error: 'The uploaded file is already in the selected format.' }); }
+  // Normalize target (allow synonyms)
+  const target = (targetRaw === 'jpg') ? 'jpeg' : (targetRaw === 'gz' ? 'gzip' : (targetRaw === 'br' ? 'brotli' : targetRaw));
+
+  // same-format detection (treat jpeg/jpg equivalently)
+  const normInput = (inputExt === 'jpg') ? 'jpeg' : inputExt;
+  if (normInput === target && !['gzip','brotli'].includes(target)) {
+    await cleanupTmp(req);
+    return res.status(400).json({ error: 'The uploaded file is already in the selected format.' });
+  }
 
   // svg safety
   if (inputExt === 'svg') {
     const ok = await isSvgSafe(inputPath);
-    if (!ok) { await cleanupTmp(req); return res.status(400).json({ error: 'Unsafe SVG content detected' }); }
+    if (!ok) { await cleanupTmp(req); return res.status(400).json({ error: 'Unsafe SVG detected' }); }
   }
 
-  // Acquire semaphore
   await acquire();
-
-  // Create out path in tmp dir
-  const outName = `${baseName}-out.${targetFormatRaw}`;
-  let outPath = path.join(path.dirname(inputPath), outName);
-
   try {
     const mimeType = mime.lookup(inputPath) || '';
+    let outExt = target === 'gzip' ? 'gz' : (target === 'brotli' ? 'br' : (target === 'jpeg' ? 'jpg' : target));
+    let outPath = path.join(path.dirname(inputPath), `${base}-out.${outExt}`);
 
-    // IMAGE PATH (sharp)
+    // ---- IMAGE ----
     if (mimeType.startsWith('image/') || ['jpg','jpeg','png','webp','avif','tiff','svg'].includes(inputExt)) {
-      const sharp = lazySharp();
+      let sharp;
+      try { sharp = require('sharp'); } catch (e) { throw new Error('sharp module missing'); }
 
       let img = sharp(inputPath, { failOnError: false });
-
-      // apply edits (limited: rotate, crop)
       if (edits && typeof edits === 'object') {
         if (edits.rotate) img = img.rotate(edits.rotate);
         if (edits.crop && edits.crop.width && edits.crop.height) {
@@ -151,102 +153,111 @@ router.post('/process', upload.single('file'), async (req, res) => {
       }
       if (width || height) img = img.resize(width || null, height || null, { fit: 'inside' });
 
-      const outExt = targetFormatRaw === 'jpg' ? 'jpeg' : targetFormatRaw;
-      outPath = path.join(path.dirname(inputPath), `${baseName}-out.${outExt}`);
+      const fmt = (target === 'jpeg' ? 'jpeg' : target);
+      outPath = path.join(path.dirname(inputPath), `${base}-out.${fmt === 'jpeg' ? 'jpg' : fmt}`);
 
-      // encoding options tuned for aggressive compression yet acceptable quality
-      if (['jpeg','jpg'].includes(outExt)) await img.jpeg({ quality, mozjpeg: true }).toFile(outPath);
-      else if (outExt === 'webp') await img.webp({ quality }).toFile(outPath);
-      else if (outExt === 'png') await img.png({ compressionLevel: 9 }).toFile(outPath);
-      else if (outExt === 'avif') await img.avif({ quality }).toFile(outPath);
+      if (fmt === 'jpeg') await img.jpeg({ quality, mozjpeg: true }).toFile(outPath);
+      else if (fmt === 'webp') await img.webp({ quality }).toFile(outPath);
+      else if (fmt === 'png') await img.png({ compressionLevel: 9 }).toFile(outPath);
+      else if (fmt === 'avif') await img.avif({ quality }).toFile(outPath);
       else await img.toFile(outPath);
 
-    // PDF PATH (ghostscript)
+    // ---- DOCX / DOC (office) ----
+    } else if (['doc','docx','rtf','odt'].includes(inputExt)) {
+      // If target is pdf or txt, try libreoffice-convert
+      if (['pdf','txt','odt','html'].includes(target)) {
+        // lazy check for libreoffice-convert npm package and libre binary
+        try {
+          if (!commandExists('libreoffice') && !commandExists('soffice')) throw new Error('LibreOffice not found on server');
+          const buf = await fs.readFile(inputPath);
+          const converted = await libreConvertBuffer(buf, target === 'txt' ? 'txt' : (target === 'odt' ? 'odt' : (target === 'html' ? 'html' : 'pdf')));
+          outPath = path.join(path.dirname(inputPath), `${base}-out.${target === 'jpeg' ? 'jpg' : target}`);
+          await fs.writeFile(outPath, converted);
+        } catch (e) {
+          throw new Error('Document conversion failed: ' + (e && e.message ? e.message : e));
+        }
+      } else if (['gzip','brotli'].includes(target)) {
+        // compress docx as binary
+        if (target === 'gzip') { outPath = path.join(path.dirname(inputPath), `${base}.docx.gz`); await compressGzip(inputPath, outPath); }
+        else { outPath = path.join(path.dirname(inputPath), `${base}.docx.br`); await compressBrotli(inputPath, outPath); }
+      } else {
+        // fallback: copy
+        await fs.copyFile(inputPath, outPath);
+      }
+
+    // ---- PLAIN TEXT (.txt, .md, .csv) ----
+    } else if (['txt','md','csv','log'].includes(inputExt)) {
+      if (target === 'gzip') {
+        outPath = path.join(path.dirname(inputPath), `${base}.txt.gz`);
+        await compressGzip(inputPath, outPath);
+      } else if (target === 'brotli') {
+        outPath = path.join(path.dirname(inputPath), `${base}.txt.br`);
+        await compressBrotli(inputPath, outPath);
+      } else if (target === 'pdf') {
+        // Convert text -> pdf using libre if available
+        try {
+          if (!commandExists('libreoffice') && !commandExists('soffice')) throw new Error('LibreOffice not found on server');
+          const buf = await fs.readFile(inputPath);
+          const converted = await libreConvertBuffer(buf, 'pdf');
+          outPath = path.join(path.dirname(inputPath), `${base}-out.pdf`);
+          await fs.writeFile(outPath, converted);
+        } catch (e) {
+          // fallback copy
+          await fs.copyFile(inputPath, outPath);
+        }
+      } else {
+        // simple copy / extension change
+        await fs.copyFile(inputPath, outPath);
+      }
+
+    // ---- PDF (compress) ----
     } else if (inputExt === 'pdf' || mimeType === 'application/pdf') {
-      // If target is pdf then compress with ghostscript; otherwise, convert not supported here
-      if (targetFormatRaw !== 'pdf') {
-        // Attempt conversion not supported: fallback copy
+      if (target !== 'pdf') {
+        // user asked a different format; not supported here -> fallback copy
         await fs.copyFile(inputPath, outPath);
       } else {
-        if (!ensureCommandExists('gs')) throw new Error('ghostscript (gs) not found on server');
-        const tmpOut = path.join(path.dirname(inputPath), `${baseName}-compressed.pdf`);
-        // choose PDFSETTINGS by quality: /screen (low), /ebook (medium), /printer (high)
+        if (!commandExists('gs')) throw new Error('ghostscript (gs) not available on server');
+        const tmpOut = path.join(path.dirname(inputPath), `${base}-compressed.pdf`);
         const setting = quality <= 40 ? '/screen' : (quality <= 75 ? '/ebook' : '/printer');
-        await runGSCompress(inputPath, tmpOut, setting);
+        await runCmd('gs', ['-sDEVICE=pdfwrite','-dCompatibilityLevel=1.4',`-dPDFSETTINGS=${setting}`,'-dNOPAUSE','-dQUIET','-dBATCH',`-sOutputFile=${tmpOut}`, inputPath]);
         await fs.rename(tmpOut, outPath);
       }
 
-    // AUDIO/VIDEO PATH (ffmpeg)
+    // ---- AUDIO/VIDEO ----
     } else if (mimeType.startsWith('audio/') || mimeType.startsWith('video/')) {
-      if (!ensureCommandExists('ffmpeg')) throw new Error('ffmpeg not found on server');
-      // Basic audio/video re-encode using ffmpeg
-      // Map quality to bitrate roughly
-      const audioBitrate = Math.max(32, Math.floor((quality / 100) * 192)); // kbps
-      const videoBitrate = Math.max(200, Math.floor((quality / 100) * 2500)); // kbps
-
-      outPath = path.join(path.dirname(inputPath), `${baseName}-out.${targetFormatRaw}`);
-
+      if (!commandExists('ffmpeg')) throw new Error('ffmpeg not available on server');
+      const audioBR = Math.max(32, Math.floor((quality / 100) * 192));
+      const videoBR = Math.max(200, Math.floor((quality / 100) * 2500));
+      outPath = path.join(path.dirname(inputPath), `${base}-out.${outExt}`);
       if (mimeType.startsWith('audio/')) {
-        // audio only
-        await runFFmpegAudio(inputPath, outPath, `${audioBitrate}k`);
+        await runCmd('ffmpeg', ['-y','-i', inputPath, '-vn', '-b:a', `${audioBR}k`, outPath]);
       } else {
-        // video: keep resolution unless width/height provided
-        const resizeArgs = (width || height) ? ['-vf', `scale=${width||-2}:${height||-2}`] : [];
-        await runFFmpegVideo(inputPath, outPath, `${videoBitrate}k`, `${audioBitrate}k`, resizeArgs);
+        await runCmd('ffmpeg', ['-y','-i', inputPath, '-b:v', `${videoBR}k`, '-b:a', `${audioBR}k`, outPath]);
       }
 
     } else {
-      // fallback copy: unknown types
+      // fallback: copy
       await fs.copyFile(inputPath, outPath);
     }
 
-    // Ensure out file exists
+    // Verify out exists
     if (!fsSync.existsSync(outPath)) throw new Error('Output file not produced');
 
-    // Send direct download
+    // Direct download
     res.setHeader('Content-Disposition', `attachment; filename="${path.basename(outPath)}"`);
     res.setHeader('Content-Type', mime.lookup(outPath) || 'application/octet-stream');
 
-    // stream file and after finish cleanup tmp dir
     const stream = fsSync.createReadStream(outPath);
     stream.on('end', async () => { await cleanupTmp(req); });
     stream.pipe(res);
 
   } catch (err) {
-    console.error('filetools_v5 processing error:', err);
+    console.error('filetools_v5 error:', err && err.stack ? err.stack : err);
     await cleanupTmp(req);
-    return res.status(500).json({ error: 'Processing failed', detail: (err && err.message) ? err.message : err.toString() });
+    return res.status(500).json({ error: 'Processing failed', detail: err && err.message ? err.message : String(err) });
   } finally {
     release();
   }
 });
-
-// small helper funcs (shell wrappers)
-async function runFFmpegAudio(input, out, abr) {
-  // ffmpeg -y -i input -vn -b:a <abr> out
-  await runCmd('ffmpeg', ['-y','-i', input, '-vn', '-b:a', abr, out]);
-}
-async function runFFmpegVideo(input, out, vbr, abr, extraArgs = []) {
-  // ffmpeg -y -i input -b:v vbr -b:a abr [extraArgs] out
-  const args = ['-y','-i', input, '-b:v', vbr, '-b:a', abr, ...extraArgs, out];
-  await runCmd('ffmpeg', args);
-}
-async function runGSCompress(input, out, setting) {
-  // gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/screen -dNOPAUSE -dQUIET -dBATCH -sOutputFile=out input
-  await runCmd('gs', ['-sDEVICE=pdfwrite','-dCompatibilityLevel=1.4',`-dPDFSETTINGS=${setting}`,'-dNOPAUSE','-dQUIET','-dBATCH',`-sOutputFile=${out}`, input]);
-}
-async function runCmd(cmd, args = []) {
-  return new Promise((resolve, reject) => {
-    const ps = spawn(cmd, args);
-    let stderr = '', stdout = '';
-    ps.stdout.on('data', d => { stdout += d.toString(); });
-    ps.stderr.on('data', d => { stderr += d.toString(); });
-    ps.on('error', e => reject(e));
-    ps.on('close', code => code === 0 ? resolve(stdout) : reject(new Error(stderr || `Exit code ${code}`)));
-  });
-}
-
-// Health
-router.get('/health', (req, res) => res.json({ ok: true, activeProcesses: active }));
 
 module.exports = router;
