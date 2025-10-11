@@ -28,8 +28,8 @@ app.use(express.json({ limit: '200kb' }));
 //import filetoolsV5 from './routes/filetools_v5.js';
 //app.use('/api/tools/file', filetoolsV5);
 
-const filetoolsV5 = require('./routes/filetools_v5.js');
-app.use('/api/tools/file', filetoolsV5);
+//const filetoolsV5 = require('./routes/filetools_v5.js');
+//app.use('/api/tools/file', filetoolsV5);
 
 //=====≈=====================================================≈=
 
