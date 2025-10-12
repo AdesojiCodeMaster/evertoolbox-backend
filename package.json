@@ -25,6 +25,9 @@
     "file-type": "^18.0.0",
     "express-rate-limit": "^6.10.0",
     "libreoffice-convert": "^1.0.0"
+    "adm-zip": "^0.5.10",
+    "fluent-ffmpeg": "^2.1.2",
+    "@ffmpeg-installer/ffmpeg": "^1.1.0"
      },
   "engines": {
     "node": ">=16"
