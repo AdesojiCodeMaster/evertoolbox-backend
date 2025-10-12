@@ -326,7 +326,8 @@ attachFileTool(app);
 //============================================================
 
 //=====≈======================================================
-require('./universal-filetool')(app);
+const fileToolRoutes = require("./universal-filetool");
+app.use(fileToolRoutes);
 //=======≈=================================≈===========≈========
 
 
