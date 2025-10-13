@@ -320,10 +320,6 @@ app.get('/api/temp/:id/:filename', (req, res) => {
 });
 
 
-//=======≈===========≈===============================≈=======
-const { attachFileTool } = require("./filetool_loader.js");
-attachFileTool(app);
-//============================================================
 
 //=====≈======================================================
 const fileToolRoutes = require("./universal-filetool");
