@@ -1,4 +1,3 @@
-// universal-filetool.js
 const express = require("express");
 const multer = require("multer");
 const sharp = require("sharp");
@@ -10,9 +9,13 @@ const PDFDocument = require("pdfkit");
 const router = express.Router();
 const upload = multer({ dest: "uploads/" });
 
+// helper to clean temp files
 function cleanup(file) {
   if (fs.existsSync(file)) fs.unlink(file, () => {});
 }
+
+// extend ffmpeg timeout
+ffmpeg.setFfmpegPath("/usr/bin/ffmpeg"); // Render’s ffmpeg path (usually available)
 
 router.post("/process", upload.single("file"), async (req, res) => {
   const { action, targetFormat, quality = 80 } = req.body;
@@ -22,92 +25,84 @@ router.post("/process", upload.single("file"), async (req, res) => {
   const originalExt = path.extname(input.originalname).slice(1);
 
   try {
-    if (!action)
-      return res.status(400).json({ error: "Please select an action." });
+    if (!action) return res.status(400).json({ error: "Please select an action." });
     if (action === "convert" && !targetFormat)
-      return res
-        .status(400)
-        .json({ error: "Please select a target format for conversion." });
+      return res.status(400).json({ error: "Please select a target format." });
     if (action === "convert" && targetFormat === originalExt)
-      return res
-        .status(400)
-        .json({ error: "Source and target formats cannot be the same." });
+      return res.status(400).json({ error: "Source and target formats are the same." });
 
-    let outputPath = `${filePath}_output.${targetFormat || originalExt}`;
+    const outputExt = targetFormat || originalExt;
+    const outputPath = `${filePath}_out.${outputExt}`;
     let outputMime = mime;
 
-    // ====== IMAGE ======
+    // ========== IMAGE ==========
     if (mime.startsWith("image/")) {
       if (action === "compress") {
         await sharp(filePath)
           .jpeg({ quality: Math.min(+quality, 90) })
           .toFile(outputPath);
-      } else if (action === "convert") {
+      } else {
         if (targetFormat === "pdf") {
           const doc = new PDFDocument({ autoFirstPage: false });
           const { width, height } = await sharp(filePath).metadata();
           doc.addPage({ size: [width, height] });
-          const imgBuffer = await sharp(filePath).jpeg({ quality: +quality }).toBuffer();
-          doc.image(imgBuffer, 0, 0, { width, height });
+          const buf = await sharp(filePath).jpeg({ quality: +quality }).toBuffer();
+          doc.image(buf, 0, 0, { width, height });
           doc.pipe(fs.createWriteStream(outputPath));
-          await new Promise((resolve) => doc.on("end", resolve));
           doc.end();
         } else {
           await sharp(filePath).toFormat(targetFormat, { quality: +quality }).toFile(outputPath);
-          outputMime = `image/${targetFormat}`;
         }
       }
+      outputMime = targetFormat === "pdf" ? "application/pdf" : "image/" + outputExt;
     }
 
-    // ====== TEXT / DOC ======
+    // ========== TEXT/DOC ==========
     else if (mime.includes("text") || mime.includes("html")) {
       const text = fs.readFileSync(filePath, "utf8");
-      if (action === "convert" && targetFormat === "pdf") {
+      if (targetFormat === "pdf") {
         const doc = new PDFDocument();
         doc.pipe(fs.createWriteStream(outputPath));
         doc.fontSize(12).text(text);
         doc.end();
+        outputMime = "application/pdf";
       } else {
         fs.writeFileSync(outputPath, text);
+        outputMime = "text/plain";
       }
-      outputMime = targetFormat === "pdf" ? "application/pdf" : "text/plain";
     }
 
-    // ====== AUDIO ======
+    // ========== AUDIO ==========
     else if (mime.startsWith("audio/")) {
       await new Promise((resolve, reject) => {
-        const cmd = ffmpeg(filePath);
-        if (action === "compress") {
-          cmd.audioBitrate("96k");
-        } else if (action === "convert") {
-          cmd.toFormat(targetFormat);
-        }
-        cmd.on("end", resolve)
-           .on("error", reject)
-           .save(outputPath);
+        const cmd = ffmpeg(filePath)
+          .audioCodec("libmp3lame")
+          .audioBitrate(action === "compress" ? "96k" : "192k")
+          .on("end", resolve)
+          .on("error", reject);
+        if (action === "convert") cmd.toFormat(targetFormat);
+        cmd.save(outputPath);
       });
-      outputMime = "audio/" + (targetFormat || originalExt);
+      outputMime = "audio/" + outputExt;
     }
 
-    // ====== VIDEO ======
+    // ========== VIDEO ==========
     else if (mime.startsWith("video/")) {
       await new Promise((resolve, reject) => {
-        const cmd = ffmpeg(filePath);
-        if (action === "compress") {
-          cmd.videoCodec("libx264")
-             .outputOptions(["-preset fast", "-crf 28"]);
-        } else if (action === "convert") {
-          cmd.toFormat(targetFormat);
-        }
-        cmd.on("end", resolve)
-           .on("error", reject)
-           .save(outputPath);
+        const cmd = ffmpeg(filePath)
+          .videoCodec("libx264")
+          .audioCodec("aac")
+          .outputOptions(action === "compress" ? ["-preset veryfast", "-crf 28"] : [])
+          .on("end", resolve)
+          .on("error", reject);
+        if (action === "convert") cmd.toFormat(targetFormat);
+        cmd.save(outputPath);
       });
-      outputMime = "video/" + (targetFormat || originalExt);
+      outputMime = "video/" + outputExt;
     }
 
-    // ====== RETURN FILE ======
-    res.setHeader("Content-Disposition", `attachment; filename=result.${targetFormat || originalExt}`);
+    // send file back
+    res.setHeader("Content-Disposition", `attachment; filename=result.${outputExt}`);
     res.setHeader("Content-Type", outputMime);
     const stream = fs.createReadStream(outputPath);
     stream.pipe(res);
@@ -117,7 +112,7 @@ router.post("/process", upload.single("file"), async (req, res) => {
     });
   } catch (err) {
     console.error("❌ Error:", err);
-    res.status(500).json({ error: "Processing failed. " + err.message });
+    res.status(500).json({ error: "Processing failed: " + err.message });
   }
 });
 
