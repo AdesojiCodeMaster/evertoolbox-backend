@@ -14,13 +14,14 @@ function cleanup(file) {
   if (fs.existsSync(file)) fs.unlink(file, () => {});
 }
 
+// Smart image compression
 async function compressBuffer(buffer, type, quality = 80) {
   if (type.startsWith('image/')) {
     return await sharp(buffer)
       .jpeg({ quality: Math.min(quality, 90) })
       .toBuffer();
   }
-  return buffer; // Non-image compression handled separately
+  return buffer;
 }
 
 router.get('/health', (req, res) => res.json({ ok: true }));
@@ -37,38 +38,39 @@ router.post('/process', upload.single('file'), async (req, res) => {
     let ext = targetFormat || originalExt;
     let filename = `result.${ext}`;
 
-    if (!action)
-      return res.status(400).json({ error: "Please select an action (convert or compress)." });
+    // Validation
+    if (!action) return res.status(400).json({ error: "Please select an action (convert or compress)." });
     if (action === 'convert' && !targetFormat)
       return res.status(400).json({ error: "Please select a target format for conversion." });
     if (action === 'convert' && targetFormat === originalExt)
       return res.status(400).json({ error: "Source and target formats cannot be the same." });
 
-    // ✅ Compression
-    if (action === 'compress') {
-      if (mime.startsWith('image/')) {
-        outBuffer = await compressBuffer(fs.readFileSync(filePath), mime, quality);
-      } else if (mime.startsWith('audio/') || mime.startsWith('video/')) {
-        const outPath = `${filePath}-compressed.${originalExt}`;
-        const isVideo = mime.startsWith('video/');
-        await new Promise((resolve, reject) => {
-          let cmd = ffmpeg(filePath)
-            .output(outPath)
-            .on('end', resolve)
-            .on('error', reject);
-          if (isVideo) cmd.videoBitrate('1000k').audioBitrate('128k');
-          else cmd.audioBitrate('128k');
-          cmd.run();
-        });
-        outBuffer = fs.readFileSync(outPath);
-        cleanup(outPath);
-      } else {
-        outBuffer = fs.readFileSync(filePath);
-      }
+    // Image compression
+    if (action === 'compress' && mime.startsWith('image/')) {
+      outBuffer = await compressBuffer(fs.readFileSync(filePath), mime, quality);
+      outMime = mime;
     }
 
-    // ✅ Conversion
+    // Audio/Video compression
+    else if (action === 'compress' && (mime.startsWith('audio/') || mime.startsWith('video/'))) {
+      const outPath = `${filePath}_compressed.${mime.startsWith('audio/') ? 'mp3' : 'mp4'}`;
+      await new Promise((resolve, reject) => {
+        ffmpeg(filePath)
+          .audioBitrate('128k')
+          .videoBitrate('800k')
+          .outputOptions('-preset veryfast')
+          .on('end', resolve)
+          .on('error', reject)
+          .save(outPath);
+      });
+      outBuffer = fs.readFileSync(outPath);
+      cleanup(outPath);
+      outMime = mime;
+    }
+
+    // Conversion
     else if (action === 'convert') {
+      // Image conversion
       if (mime.startsWith('image/')) {
         const image = sharp(filePath);
         if (targetFormat === 'pdf') {
@@ -77,8 +79,8 @@ router.post('/process', upload.single('file'), async (req, res) => {
           doc.on('data', (d) => chunks.push(d));
           doc.on('end', () => {
             const buffer = Buffer.concat(chunks);
+            res.setHeader('Content-Type', 'application/octet-stream');
             res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-            res.setHeader('Content-Type', 'application/pdf');
             res.end(buffer);
             cleanup(filePath);
           });
@@ -92,7 +94,10 @@ router.post('/process', upload.single('file'), async (req, res) => {
           outBuffer = await image.toFormat(targetFormat, { quality: +quality }).toBuffer();
           outMime = `image/${targetFormat}`;
         }
-      } else if (mime.includes('text') || mime.includes('json') || mime.includes('html')) {
+      }
+
+      // Document/text conversion
+      else if (mime.includes('text') || mime.includes('json') || mime.includes('html')) {
         const text = fs.readFileSync(filePath, 'utf8');
         if (targetFormat === 'pdf') {
           const doc = new PDFDocument();
@@ -100,8 +105,8 @@ router.post('/process', upload.single('file'), async (req, res) => {
           doc.on('data', (d) => chunks.push(d));
           doc.on('end', () => {
             const buffer = Buffer.concat(chunks);
+            res.setHeader('Content-Type', 'application/octet-stream');
             res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-            res.setHeader('Content-Type', 'application/pdf');
             res.end(buffer);
             cleanup(filePath);
           });
@@ -112,7 +117,10 @@ router.post('/process', upload.single('file'), async (req, res) => {
           outBuffer = Buffer.from(text, 'utf8');
           outMime = 'text/plain';
         }
-      } else if (mime.startsWith('audio/') || mime.startsWith('video/')) {
+      }
+
+      // Audio/video conversion
+      else if (mime.startsWith('audio/') || mime.startsWith('video/')) {
         const outPath = `${filePath}.${targetFormat}`;
         await new Promise((resolve, reject) => {
           ffmpeg(filePath)
@@ -124,14 +132,17 @@ router.post('/process', upload.single('file'), async (req, res) => {
         outBuffer = fs.readFileSync(outPath);
         cleanup(outPath);
         outMime = mime.startsWith('audio/') ? `audio/${targetFormat}` : `video/${targetFormat}`;
-      } else {
+      }
+
+      // Fallback
+      else {
         outBuffer = fs.readFileSync(filePath);
       }
     }
 
     cleanup(filePath);
+    res.setHeader('Content-Type', 'application/octet-stream');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.setHeader('Content-Type', outMime);
     res.end(outBuffer);
 
   } catch (e) {
