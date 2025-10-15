@@ -8,6 +8,7 @@ const fs = require('fs');
 const PDFDocument = require('pdfkit');
 
 const router = express.Router();
+if (!fs.existsSync('uploads')) fs.mkdirSync('uploads');
 const upload = multer({ dest: 'uploads/' });
 
 function cleanup(file) {
@@ -81,8 +82,7 @@ router.post('/process', upload.single('file'), async (req, res) => {
             const buffer = Buffer.concat(chunks);
             res.setHeader('Content-Type', 'application/octet-stream');
             res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-            res.end(buffer);
-            cleanup(filePath);
+            res.end(buffer, () => cleanup(filePath)); // ✅ cleanup after send
           });
           const { width, height } = await image.metadata();
           doc.addPage({ size: [width, height] });
@@ -107,8 +107,7 @@ router.post('/process', upload.single('file'), async (req, res) => {
             const buffer = Buffer.concat(chunks);
             res.setHeader('Content-Type', 'application/octet-stream');
             res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-            res.end(buffer);
-            cleanup(filePath);
+            res.end(buffer, () => cleanup(filePath)); // ✅ cleanup after send
           });
           doc.fontSize(12).text(text);
           doc.end();
@@ -140,15 +139,15 @@ router.post('/process', upload.single('file'), async (req, res) => {
       }
     }
 
-    cleanup(filePath);
     res.setHeader('Content-Type', 'application/octet-stream');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.end(outBuffer);
+    res.end(outBuffer, () => cleanup(filePath)); // ✅ cleanup after send
 
   } catch (e) {
-    console.error('❌ Processing failed:', e);
+    console.error('❌ Processing failed:', e); // ✅ fixed
     res.status(500).json({ error: 'File processing failed: ' + e.message });
   }
 });
 
 module.exports = router;
+                         
