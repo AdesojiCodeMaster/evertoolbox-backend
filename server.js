@@ -328,6 +328,9 @@ const fileTool = require('./universal-filetool');
 app.use("/", fileTool);
 //=======≈=================================≈===========≈================
 
+app._router.stack
+  .filter(r => r.route)
+  .forEach(r => console.log("➡️", Object.keys(r.route.methods)[0].toUpperCase(), r.route.path));
 
 
 // --------------------
