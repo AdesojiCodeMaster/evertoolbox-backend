@@ -198,9 +198,4 @@ app.post("/api/tools/file", upload.single("file"), async (req, res) => {
 // Health check
 app.get("/", (req, res) => res.send("✅ EverToolbox File Tool API running."));
 
-// -------------------------------
-//     START SERVER
-// -------------------------------
-app.listen(PORT, () => {
-  console.log(`✅ Server running on port ${PORT}`);
-});
+
