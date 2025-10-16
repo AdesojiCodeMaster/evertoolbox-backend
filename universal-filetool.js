@@ -1,151 +1,129 @@
 // universal-filetool.js
-const express = require('express');
-const multer = require('multer');
-const sharp = require('sharp');
-const ffmpeg = require('fluent-ffmpeg');
-const path = require('path');
-const fs = require('fs');
-const PDFDocument = require('pdfkit');
+import express from "express";
+import multer from "multer";
+import fs from "fs";
+import path from "path";
+import sharp from "sharp";
+import ffmpeg from "fluent-ffmpeg";
+import PDFDocument from "pdfkit";
+import { PDFDocument } from "pdf-lib";
 
-const router = express.Router();
-if (!fs.existsSync('uploads')) fs.mkdirSync('uploads');
-const upload = multer({ dest: 'uploads/' });
+const app = express();
+const upload = multer({ dest: "uploads/" });
+const cleanup = (p) => fs.existsSync(p) && fs.unlinkSync(p);
 
-function cleanup(file) {
-  if (fs.existsSync(file)) fs.unlink(file, () => {});
-}
+app.use(express.static("."));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// Smart compression
-async function compressBuffer(buffer, type, quality = 70) {
-  if (type.startsWith('image/')) {
-    return await sharp(buffer).jpeg({ quality: Math.min(quality, 85) }).toBuffer();
-  }
-  return buffer;
-}
-
-router.get('/health', (req, res) => res.json({ ok: true }));
-
-router.post('/process', upload.single('file'), async (req, res) => {
+app.post("/process", upload.single("file"), async (req, res) => {
   try {
     const { action, targetFormat, quality = 80 } = req.body;
-    const input = req.file;
-    const filePath = input.path;
-    const mime = input.mimetype;
-    const originalExt = path.extname(input.originalname).slice(1);
-
-    let outBuffer, outMime = mime;
+    const file = req.file;
+    const filePath = file.path;
+    const mime = file.mimetype;
+    const originalExt = path.extname(file.originalname).slice(1);
     let ext = targetFormat || originalExt;
     let filename = `result.${ext}`;
+    let outBuffer, outMime = mime;
 
-    if (!action) return res.status(400).json({ error: "Missing action (convert/compress)." });
+    if (!action) return res.status(400).json({ error: "Missing action" });
 
-    // 🗜️ COMPRESSION
-    if (action === 'compress') {
-      if (mime.startsWith('image/')) {
-        outBuffer = await compressBuffer(fs.readFileSync(filePath), mime, quality);
-      } else if (mime.startsWith('audio/') || mime.startsWith('video/')) {
-        const outPath = `${filePath}_compressed.${mime.startsWith('audio/') ? 'mp3' : 'mp4'}`;
+    // 🗜️ Compression
+    if (action === "compress") {
+      if (mime.startsWith("image/")) {
+        outBuffer = await sharp(filePath).jpeg({ quality: +quality }).toBuffer();
+        outMime = mime;
+      } else if (mime.startsWith("audio/") || mime.startsWith("video/")) {
+        const outExt = mime.startsWith("audio/") ? "mp3" : "mp4";
+        const outPath = `${filePath}.${outExt}`;
         await new Promise((resolve, reject) => {
           ffmpeg(filePath)
-            .audioBitrate('128k')
-            .videoBitrate('800k')
-            .outputOptions('-preset ultrafast')
-            .on('end', resolve)
-            .on('error', reject)
+            .outputOptions(["-b:v 800k", "-b:a 128k", "-preset superfast"])
+            .on("end", resolve)
+            .on("error", reject)
             .save(outPath);
         });
         outBuffer = fs.readFileSync(outPath);
+        filename = `compressed.${outExt}`;
+        outMime = mime.startsWith("audio/") ? `audio/${outExt}` : `video/${outExt}`;
         cleanup(outPath);
       } else {
         outBuffer = fs.readFileSync(filePath);
       }
     }
 
-    // 🔄 CONVERSION
-    else if (action === 'convert') {
-      if (!targetFormat) return res.status(400).json({ error: "Missing target format." });
-      if (targetFormat === originalExt) return res.status(400).json({ error: "Source and target formats are the same." });
-
-      // 🖼️ Image Conversion
-      if (mime.startsWith('image/')) {
-        const image = sharp(filePath);
-
-        // → PDF
-        if (targetFormat === 'pdf') {
+    // 🔄 Conversion
+    else if (action === "convert") {
+      if (mime.startsWith("image/")) {
+        if (targetFormat === "pdf") {
           const doc = new PDFDocument({ autoFirstPage: false });
           const chunks = [];
-          doc.on('data', d => chunks.push(d));
-          doc.on('end', () => {
+          doc.on("data", (d) => chunks.push(d));
+          doc.on("end", () => {
             const buffer = Buffer.concat(chunks);
-            res.setHeader('Content-Type', 'application/pdf');
-            res.setHeader('Content-Disposition', 'attachment; filename="result.pdf"');
+            res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+            res.setHeader("Content-Type", "application/pdf");
             res.end(buffer, () => cleanup(filePath));
           });
+          const image = sharp(filePath);
           const { width, height } = await image.metadata();
-          const imgBuffer = await image.jpeg({ quality: 90 }).toBuffer();
           doc.addPage({ size: [width, height] });
-          doc.image(imgBuffer, 0, 0, { width, height });
+          const imgBuf = await image.jpeg({ quality: 90 }).toBuffer();
+          doc.image(imgBuf, 0, 0, { width, height });
           doc.end();
           return;
+        } else {
+          outBuffer = await sharp(filePath).toFormat(targetFormat, { quality: +quality }).toBuffer();
+          outMime = `image/${targetFormat}`;
         }
-
-        // → Image
-        const valid = ['jpeg', 'jpg', 'png', 'webp', 'tiff', 'gif'];
-        if (!valid.includes(targetFormat)) throw new Error(`Unsupported target format: ${targetFormat}`);
-        outBuffer = await image.toFormat(targetFormat, { quality: +quality }).toBuffer();
-        outMime = `image/${targetFormat}`;
-      }
-
-      // 📄 Text/HTML → Anything
-      else if (mime.includes('text') || mime.includes('json') || mime.includes('html')) {
-        const text = fs.readFileSync(filePath, 'utf8');
-        if (targetFormat === 'pdf') {
-          const doc = new PDFDocument();
-          const chunks = [];
-          doc.on('data', d => chunks.push(d));
-          doc.on('end', () => {
-            const buffer = Buffer.concat(chunks);
-            res.setHeader('Content-Type', 'application/pdf');
-            res.setHeader('Content-Disposition', 'attachment; filename="result.pdf"');
-            res.end(buffer, () => cleanup(filePath));
+      } else if (mime === "application/pdf") {
+        const pdfData = fs.readFileSync(filePath);
+        const pdfDoc = await PDFDocument.load(pdfData);
+        if (["txt", "html"].includes(targetFormat)) {
+          const text = pdfDoc.getPageIndices().map(i => `Page ${i+1}`).join("\n\n");
+          outBuffer = Buffer.from(text, "utf8");
+          outMime = targetFormat === "txt" ? "text/plain" : "text/html";
+        } else if (["png", "jpg", "jpeg", "webp"].includes(targetFormat)) {
+          const tmpOut = `${filePath}.${targetFormat}`;
+          await new Promise((resolve, reject) => {
+            ffmpeg(filePath)
+              .outputOptions(["-frames:v 1"])
+              .output(tmpOut)
+              .on("end", resolve)
+              .on("error", reject)
+              .run();
           });
-          doc.fontSize(12).text(text);
-          doc.end();
-          return;
-        }
-        outBuffer = Buffer.from(text, 'utf8');
-        outMime = 'text/plain';
-      }
-
-      // 🎧 Audio/🎬 Video Conversion
-      else if (mime.startsWith('audio/') || mime.startsWith('video/')) {
+          outBuffer = fs.readFileSync(tmpOut);
+          outMime = `image/${targetFormat}`;
+          cleanup(tmpOut);
+        } else throw new Error("Unsupported PDF conversion target.");
+      } else if (mime.startsWith("audio/") || mime.startsWith("video/")) {
         const outPath = `${filePath}.${targetFormat}`;
         await new Promise((resolve, reject) => {
           ffmpeg(filePath)
+            .outputOptions(["-preset superfast"])
             .output(outPath)
-            .outputOptions('-preset ultrafast')
-            .on('end', resolve)
-            .on('error', reject)
+            .on("end", resolve)
+            .on("error", reject)
             .run();
         });
         outBuffer = fs.readFileSync(outPath);
+        outMime = mime.startsWith("audio/") ? `audio/${targetFormat}` : `video/${targetFormat}`;
         cleanup(outPath);
-        outMime = mime.startsWith('audio/') ? `audio/${targetFormat}` : `video/${targetFormat}`;
-      }
-
-      else {
+      } else {
         outBuffer = fs.readFileSync(filePath);
       }
     }
 
-    res.setHeader('Content-Type', 'application/octet-stream');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.setHeader("Content-Type", outMime);
     res.end(outBuffer, () => cleanup(filePath));
-
   } catch (e) {
-    console.error('❌ Processing failed:', e);
-    res.status(500).json({ error: 'Processing error: ' + e.message });
+    console.error("❌ Processing failed:", e);
+    res.status(500).json({ error: "Processing failed: " + e.message });
   }
 });
 
-module.exports = router;
+app.listen(3000, () => console.log("✅ Server running on http://localhost:3000"));
+  
