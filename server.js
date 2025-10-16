@@ -322,8 +322,10 @@ app.get('/api/temp/:id/:filename', (req, res) => {
 
 
 //=====≈===============================================================
-const fileTool = require('./universal-filetool');
-app.use('/api/tools/file', fileTool);
+//const fileTool = require('./universal-filetool');
+//app.use('/api/tools/file', fileTool);
+// mount the file tool router
+app.use("/", fileTool);
 //=======≈=================================≈===========≈================
 
 
