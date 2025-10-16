@@ -106,7 +106,7 @@ async function compressFile(file) {
   return outputFile;
 }
 
-router.post("/api/tools/file", upload.single("file"), async (req, res) => {
+router.post("/", upload.single("file"), async (req, res) => {
   const { action, targetFormat } = req.body;
   const file = req.file;
 
