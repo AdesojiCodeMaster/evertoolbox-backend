@@ -1,305 +1,187 @@
-// universal-filetool.js
-// CommonJS router compatible with server.js that requires it.
-// Requires: express, multer, sharp, fluent-ffmpeg, pdfkit, mime-types, fs, path
+// =====================================================
+// 🌍 UNIVERSAL FILE TOOL
+// Works perfectly with CommonJS backend (server.js)
+// =====================================================
 
-const express = require('express');
-const multer = require('multer');
-const sharp = require('sharp');
-const ffmpeg = require('fluent-ffmpeg');
-const PDFDocument = require('pdfkit');
-const fs = require('fs');
-const path = require('path');
-const mime = require('mime-types');
+// --- DOM Elements ---
+const drop = document.getElementById("drop");
+const fileInput = document.getElementById("fileInput");
+const preview = document.getElementById("preview");
+const actionSelect = document.getElementById("action");
+const formatSelect = document.getElementById("format");
+const qualityInput = document.getElementById("quality");
+const processBtn = document.getElementById("processBtn");
+const message = document.getElementById("message");
 
-const router = express.Router();
-const upload = multer({ dest: 'uploads/' });
+let selectedFile = null;
 
-// Ensure directories exist
-if (!fs.existsSync('uploads')) fs.mkdirSync('uploads');
-if (!fs.existsSync('jobs')) fs.mkdirSync('jobs');
-
-// Helper: safe cleanup
-function safeUnlink(p) {
-  try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch (e) { /* ignore */ }
-}
-
-// Helper: map extension to mime (fallback)
-const mimeMap = {
-  jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp',
-  pdf: 'application/pdf', txt: 'text/plain', html: 'text/html',
-  mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg',
-  mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime', avi: 'video/x-msvideo'
+// --- Format Categories ---
+const formatOptions = {
+  image: ["jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff"],
+  document: ["pdf", "txt", "docx", "html"],
+  audio: ["mp3", "wav", "ogg", "m4a"],
+  video: ["mp4", "avi", "mkv", "mov", "webm"]
 };
 
-// Health
-router.get('/health', (req, res) => res.json({ ok: true }));
+// =====================================================
+// 📂 FILE HANDLING
+// =====================================================
+drop.addEventListener("click", () => fileInput.click());
+fileInput.addEventListener("change", (e) => handleFile(e.target.files[0]));
 
-// Main endpoint expected by the UI: POST /process
-router.post('/process', upload.single('file'), async (req, res) => {
-  // Immediately validate
-  if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
+drop.addEventListener("dragover", (e) => {
+  e.preventDefault();
+  drop.classList.add("dragover");
+});
 
-  const action = (req.body.action || '').toLowerCase();
-  const targetFormat = (req.body.targetFormat || '').toLowerCase();
-  const quality = Math.min(100, Math.max(10, parseInt(req.body.quality || '80')));
+drop.addEventListener("dragleave", () => drop.classList.remove("dragover"));
 
-  const input = req.file;
-  const inputPath = input.path;
-  const inputMime = input.mimetype || mime.lookup(input.originalname) || 'application/octet-stream';
-  const inputExt = (path.extname(input.originalname) || '').replace('.', '').toLowerCase();
-  const baseName = path.basename(input.originalname, path.extname(input.originalname));
+drop.addEventListener("drop", (e) => {
+  e.preventDefault();
+  drop.classList.remove("dragover");
+  handleFile(e.dataTransfer.files[0]);
+});
+
+function handleFile(file) {
+  if (!file) return;
+  selectedFile = file;
+  drop.querySelector("#dropText").textContent = file.name;
+
+  const type = file.type;
+  const category = type.startsWith("image/")
+    ? "image"
+    : type.startsWith("video/")
+    ? "video"
+    : type.startsWith("audio/")
+    ? "audio"
+    : "document";
+
+  populateFormatSelect(category);
+  showPreview(file);
+}
+
+// =====================================================
+// 🎯 POPULATE TARGET FORMAT OPTIONS
+// =====================================================
+function populateFormatSelect(category) {
+  formatSelect.innerHTML = "";
+  const options = formatOptions[category] || [];
+
+  options.forEach((fmt) => {
+    const opt = document.createElement("option");
+    opt.value = fmt;
+    opt.textContent = fmt.toUpperCase();
+    formatSelect.appendChild(opt);
+  });
+}
+
+// =====================================================
+// 🖼️ FILE PREVIEW
+// =====================================================
+function showPreview(file) {
+  const fileURL = URL.createObjectURL(file);
+  const type = file.type;
+
+  preview.style.display = "block";
+
+  if (type.startsWith("image/")) {
+    preview.innerHTML = `<img src="${fileURL}" style="max-width:100%;border-radius:12px;">`;
+  } else if (type.startsWith("video/")) {
+    preview.innerHTML = `<video controls src="${fileURL}" style="width:100%;border-radius:12px;"></video>`;
+  } else if (type.startsWith("audio/")) {
+    preview.innerHTML = `<audio controls src="${fileURL}" style="width:100%;"></audio>`;
+  } else if (type === "application/pdf") {
+    preview.innerHTML = `
+      <iframe src="${fileURL}" type="application/pdf" 
+              style="width:100%;height:500px;border:none;border-radius:12px;">
+      </iframe>
+      <small style="color:#666;">PDF Preview</small>`;
+  } else {
+    preview.innerHTML = `<div style="padding:10px;color:#444;">
+      Selected file: <strong>${file.name}</strong><br>
+      Size: ${(file.size / 1024).toFixed(1)} KB
+    </div>`;
+  }
+}
+
+// =====================================================
+// ⚙️ ACTION HANDLER
+// =====================================================
+actionSelect.addEventListener("change", () => {
+  const action = actionSelect.value;
+  formatSelect.disabled = action === "compress"; // freeze during compression
+});
+
+// =====================================================
+// 🚀 PROCESS FILE
+// =====================================================
+processBtn.addEventListener("click", async () => {
+  if (!selectedFile) {
+    showMessage("⚠️ Please upload a file first.");
+    return;
+  }
+
+  const action = actionSelect.value;
+  const targetFormat = formatSelect.value;
+  const quality = qualityInput.value || 80;
+
+  const inputExt = selectedFile.name.split(".").pop().toLowerCase();
+
+  // Prevent same-format conversion
+  if (action === "convert" && targetFormat === inputExt) {
+    showMessage("⚠️ Cannot convert file to the same format.");
+    return;
+  }
+
+  const formData = new FormData();
+  formData.append("file", selectedFile);
+  formData.append("action", action);
+  formData.append("targetFormat", targetFormat);
+  formData.append("quality", quality);
+
+  processBtn.disabled = true;
+  showMessage("⏳ Processing file, please wait...");
 
   try {
-    if (!action || !['convert', 'compress'].includes(action)) {
-      safeUnlink(inputPath);
-      return res.status(400).json({ error: 'Invalid or missing action (convert/compress).' });
+    const response = await fetch("http://localhost:3000/process", {
+      method: "POST",
+      body: formData,
+    });
+
+    if (!response.ok) {
+      throw new Error("❌ Processing error");
     }
 
-    // Block avif entirely
-    if (targetFormat === 'avif' || inputExt === 'avif' || inputMime === 'image/avif') {
-      safeUnlink(inputPath);
-      return res.status(400).json({ error: 'AVIF is not supported.' });
+    const blob = await response.blob();
+    const url = window.URL.createObjectURL(blob);
+
+    const contentDisposition = response.headers.get("Content-Disposition");
+    let filename = "processed_file";
+    if (contentDisposition && contentDisposition.includes("filename=")) {
+      filename = contentDisposition.split("filename=")[1].replace(/['"]/g, "");
     }
 
-    // Prepare variables for output
-    let outBuffer = null;
-    let outPath = null;
-    let outExt = '';
-    let outMime = '';
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
 
-    // ----------------------------
-    // COMPRESSION
-    // ----------------------------
-    if (action === 'compress') {
-      // Image compression: always re-encode to reduce size reliably
-      if (inputMime.startsWith('image/')) {
-        const img = sharp(inputPath);
-        const meta = await img.metadata();
-
-        if (meta.hasAlpha) {
-          // keep transparency -> webp for better compression
-          outExt = 'webp';
-          const buf = await img.webp({ quality: Math.max(30, Math.min(quality, 85)) }).toBuffer();
-          outBuffer = buf; outMime = mimeMap[outExt] || 'image/webp';
-        } else {
-          // no alpha -> jpeg
-          outExt = 'jpg';
-          const buf = await img.jpeg({ quality: Math.max(30, Math.min(quality, 90)), mozjpeg: true }).toBuffer();
-          outBuffer = buf; outMime = 'image/jpeg';
-        }
-      }
-
-      // Audio/Video compression via ffmpeg -> mp3/mp4
-      else if (inputMime.startsWith('audio/') || inputMime.startsWith('video/')) {
-        outExt = inputMime.startsWith('audio/') ? 'mp3' : 'mp4';
-        outPath = path.join('jobs', `${baseName}_compressed.${outExt}`);
-        await new Promise((resolve, reject) => {
-          let cmd = ffmpeg(inputPath)
-            .audioBitrate('128k')
-            .outputOptions(['-preset ultrafast', '-movflags +faststart']);
-          if (inputMime.startsWith('video/')) {
-            cmd = cmd.videoBitrate('800k');
-          }
-          cmd.on('end', resolve).on('error', reject).save(outPath);
-        });
-        outBuffer = fs.readFileSync(outPath);
-        outMime = mimeMap[outExt] || mime.lookup(outExt) || 'application/octet-stream';
-        safeUnlink(outPath);
-      } else {
-        // fallback: copy
-        outExt = inputExt || 'bin';
-        outBuffer = fs.readFileSync(inputPath);
-        outMime = inputMime;
-      }
-
-      // Final filename
-      const filename = `${baseName}_compressed.${outExt || inputExt}`;
-      // send buffer
-      res.setHeader('Content-Type', outMime || 'application/octet-stream');
-      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-      res.end(outBuffer, () => safeUnlink(inputPath));
-      return;
-    }
-
-    // ----------------------------
-    // CONVERSION
-    // ----------------------------
-    if (action === 'convert') {
-      if (!targetFormat) {
-        safeUnlink(inputPath);
-        return res.status(400).json({ error: 'Please select a target format for conversion.' });
-      }
-      if (targetFormat === inputExt) {
-        safeUnlink(inputPath);
-        return res.status(400).json({ error: 'Source and target formats cannot be the same.' });
-      }
-
-      // IMAGE -> PDF
-      if (inputMime.startsWith('image/')) {
-        if (targetFormat === 'pdf') {
-          const image = sharp(inputPath);
-          const meta = await image.metadata();
-          const imgBuf = await image.jpeg({ quality: Math.max(70, Math.min(quality, 95)) }).toBuffer();
-
-          // create PDF with pdfkit
-          const doc = new PDFDocument({ autoFirstPage: false });
-          const chunks = [];
-          doc.on('data', (c) => chunks.push(c));
-          doc.on('end', () => {
-            const pdfBuf = Buffer.concat(chunks);
-            const filename = `${baseName}.pdf`;
-            res.setHeader('Content-Type', 'application/pdf');
-            res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-            res.end(pdfBuf, () => safeUnlink(inputPath));
-          });
-          doc.addPage({ size: [meta.width, meta.height] });
-          doc.image(imgBuf, 0, 0, { width: meta.width, height: meta.height });
-          doc.end();
-          return;
-        } else {
-          // image -> image (jpeg/png/webp)
-          const fmt = targetFormat === 'jpg' ? 'jpeg' : targetFormat;
-          const buf = await sharp(inputPath).toFormat(fmt, { quality: Math.max(60, Math.min(quality, 95)) }).toBuffer();
-          outBuffer = buf;
-          outExt = (fmt === 'jpeg' ? 'jpg' : fmt);
-          outMime = mimeMap[outExt] || `image/${outExt}`;
-        }
-      }
-
-      // PDF -> image / txt / html
-      else if (inputMime === 'application/pdf') {
-        // PDF -> image (first page)
-        if (['png', 'jpg', 'jpeg', 'webp'].includes(targetFormat)) {
-          outExt = (targetFormat === 'jpeg') ? 'jpg' : targetFormat;
-          outPath = path.join('jobs', `${baseName}_page1.${outExt}`);
-
-          // Use ffmpeg to extract first page as image
-          await new Promise((resolve, reject) => {
-            ffmpeg(inputPath)
-              .outputOptions(['-frames:v 1'])
-              .output(outPath)
-              .on('end', resolve)
-              .on('error', reject)
-              .run();
-          });
-
-          // if ffmpeg produced a file
-          if (!fs.existsSync(outPath)) throw new Error('PDF to image conversion failed.');
-          outBuffer = fs.readFileSync(outPath);
-          outMime = mimeMap[outExt] || `image/${outExt}`;
-          safeUnlink(outPath);
-        }
-
-        // PDF -> txt/html (simple extract fallback)
-        else if (targetFormat === 'txt' || targetFormat === 'html') {
-          // We will do a best-effort: use external poppler pdftotext if available, else fallback to a simple message
-          const txtPath = path.join('jobs', `${baseName}.txt`);
-          // Try pdftotext cli if available
-          const { exec } = require('child_process');
-          try {
-            await new Promise((resolve, reject) => {
-              exec(`pdftotext "${inputPath}" "${txtPath}"`, (err) => {
-                if (err) return reject(err);
-                resolve();
-              });
-            });
-            const txt = fs.readFileSync(txtPath, 'utf8');
-            outBuffer = Buffer.from(txt, 'utf8');
-            outMime = targetFormat === 'txt' ? 'text/plain' : 'text/html';
-            safeUnlink(txtPath);
-          } catch (e) {
-            // Fallback: short placeholder because OCR isn't available here
-            const fallback = 'PDF text extraction is not available in this environment.';
-            outBuffer = Buffer.from(fallback, 'utf8');
-            outMime = targetFormat === 'txt' ? 'text/plain' : 'text/html';
-          }
-        }
-
-        // PDF -> PDF (copy)
-        else if (targetFormat === 'pdf') {
-          outBuffer = fs.readFileSync(inputPath);
-          outExt = 'pdf';
-          outMime = 'application/pdf';
-        } else {
-          throw new Error('Unsupported PDF conversion target.');
-        }
-      }
-
-      // Audio/Video -> conversion
-      else if (inputMime.startsWith('audio/') || inputMime.startsWith('video/')) {
-        outExt = targetFormat || (inputMime.startsWith('audio/') ? 'mp3' : 'mp4');
-        outPath = path.join('jobs', `${baseName}_converted.${outExt}`);
-
-        await new Promise((resolve, reject) => {
-          let cmd = ffmpeg(inputPath).output(outPath).outputOptions(['-preset superfast', '-movflags +faststart']);
-          // set reasonable bitrates
-          if (inputMime.startsWith('video/')) cmd = cmd.videoBitrate('800k').audioBitrate('128k');
-          else cmd = cmd.audioBitrate('128k');
-
-          cmd.on('end', resolve).on('error', reject).run();
-        });
-
-        outBuffer = fs.readFileSync(outPath);
-        outMime = mimeMap[outExt] || mime.lookup(outExt) || (inputMime.startsWith('audio/') ? `audio/${outExt}` : `video/${outExt}`);
-        safeUnlink(outPath);
-      }
-
-      // Text/HTML -> PDF or plain
-      else if (inputMime.startsWith('text/') || inputMime.includes('json') || inputMime.includes('html')) {
-        const txt = fs.readFileSync(inputPath, 'utf8');
-        if (targetFormat === 'pdf') {
-          const doc = new PDFDocument();
-          const chunks = [];
-          doc.on('data', (c) => chunks.push(c));
-          doc.on('end', () => {
-            const pdfBuf = Buffer.concat(chunks);
-            const filename = `${baseName}.pdf`;
-            res.setHeader('Content-Type', 'application/pdf');
-            res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-            res.end(pdfBuf, () => safeUnlink(inputPath));
-          });
-          doc.fontSize(12).text(txt);
-          doc.end();
-          return;
-        } else {
-          outBuffer = Buffer.from(txt, 'utf8');
-          outExt = targetFormat || 'txt';
-          outMime = mimeMap[outExt] || 'text/plain';
-        }
-      }
-
-      // fallback: copy
-      else {
-        outBuffer = fs.readFileSync(inputPath);
-        outExt = targetFormat || inputExt;
-        outMime = mime.lookup(outExt) || inputMime || 'application/octet-stream';
-      }
-
-      // Build filename (converted)
-      if (!outExt) {
-        // if we didn't set outExt earlier, try derive from targetFormat or inputExt
-        outExt = targetFormat || inputExt || 'bin';
-      }
-      const filename = `${baseName}_converted.${outExt}`;
-
-      // send buffer
-      res.setHeader('Content-Type', outMime || 'application/octet-stream');
-      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-      res.end(outBuffer, () => safeUnlink(inputPath));
-      return;
-    }
-
-    // Should not reach here
-    safeUnlink(inputPath);
-    return res.status(400).json({ error: 'Unknown action' });
-
+    window.URL.revokeObjectURL(url);
+    showMessage("✅ File processed and downloaded successfully!");
   } catch (err) {
-    console.error('Processing error:', err);
-    safeUnlink(inputPath);
-    // Return JSON error for frontend to parse
-    return res.status(500).json({ error: err.message || 'Processing error' });
+    console.error("❌ Error:", err);
+    showMessage("❌ Processing failed. Please try again.");
+  } finally {
+    processBtn.disabled = false;
   }
 });
 
-module.exports = router;
-  
+// =====================================================
+// 💬 MESSAGE DISPLAY
+// =====================================================
+function showMessage(msg) {
+  message.textContent = msg;
+  message.style.display = "block";
+}
