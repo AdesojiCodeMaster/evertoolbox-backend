@@ -22,7 +22,7 @@ const filetool = require("./universal-filetool");
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '200kb' }));
+app.use(express.json());
 
 // storage
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
@@ -330,7 +330,7 @@ app.get("/", (req, res) => {
 
 
 const fileTool = require('./universal-filetool');
-app.use('/api/tools/file', fileTool);
+app.use('/api/tools', fileTool);
 //=======≈=================================≈===========≈================
 
 
