@@ -16,6 +16,7 @@ const sharp = require('sharp');
 const googleTTS = require('google-tts-api'); // generate base64 audio
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
+const filetool = require("./universal-filetool");
 
 
 
@@ -319,6 +320,13 @@ app.get('/api/temp/:id/:filename', (req, res) => {
   });
 });
 
+
+app.use(express.static(__dirname));
+
+// Serve index.html for root requests
+app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "index.html"));
+});
 
 
 const fileTool = require('./universal-filetool');
