@@ -1,145 +1,119 @@
 //universal-filetool.js
 const express = require("express");
 const multer = require("multer");
+const fs = require("fs");
+const path = require("path");
 const sharp = require("sharp");
 const ffmpeg = require("fluent-ffmpeg");
 const { exec } = require("child_process");
-const fs = require("fs");
-const path = require("path");
-const JSZip = require("jszip");
+const PDFDocument = require("pdfkit");
 
-const router = express.Router();
 const upload = multer({ dest: "uploads/" });
+const router = express.Router();
 
-function cleanAndSend(res, outputPath, filename) {
-  res.download(outputPath, filename, () => {
-    fs.unlink(outputPath, () => {});
-  });
-}
+router.use(upload.single("file"));
 
-router.post("/", upload.single("file"), async (req, res) => {
-  const mode = req.body.mode || "convert";
-  const targetFormat = req.body.targetFormat;
-  const inputPath = req.file.path;
-  const inputExt = path.extname(req.file.originalname).toLowerCase().replace(".", "");
-  const outputExt = targetFormat || inputExt;
-  const outputDir = "processed";
-  const outputPath = path.join(outputDir, `${Date.now()}.${outputExt}`);
-  fs.mkdirSync(outputDir, { recursive: true });
-
-  // Supported formats
-  const imageFormats = ["jpg", "jpeg", "png", "webp", "gif", "tiff", "bmp"];
-  const audioFormats = ["mp3", "wav", "ogg", "aac", "flac"];
-  const videoFormats = ["mp4", "avi", "mov", "webm", "mkv"];
-  const docFormats = ["pdf", "docx", "txt", "md", "html"];
-
+router.post("/", async (req, res) => {
   try {
-    // Conversion
+    const file = req.file;
+    const mode = req.body.mode;
+    const targetFormat = req.body.targetFormat;
+    const inputPath = file.path;
+    const filename = Date.now() + "." + (targetFormat || file.originalname.split(".").pop());
+    const outputPath = path.join("processed", filename);
+
+    if (!fs.existsSync("processed")) fs.mkdirSync("processed");
+
     if (mode === "convert") {
-      if (inputExt === outputExt) {
-        fs.unlinkSync(inputPath);
-        return res.status(400).json({ error: "Source and target formats are the same" });
-      }
-
-      // Images
-      if (imageFormats.includes(outputExt)) {
-        await sharp(inputPath).toFormat(outputExt).toFile(outputPath);
-        return cleanAndSend(res, outputPath, `converted.${outputExt}`);
-      }
-
-      // Audio
-      if (audioFormats.includes(outputExt)) {
-        await new Promise((resolve, reject) => {
-          ffmpeg(inputPath)
-            .toFormat(outputExt)
-            .on("end", resolve)
-            .on("error", reject)
-            .save(outputPath);
-        });
-        return cleanAndSend(res, outputPath, `converted.${outputExt}`);
-      }
-
-      // Video
-      if (videoFormats.includes(outputExt)) {
-        await new Promise((resolve, reject) => {
-          ffmpeg(inputPath)
-            .toFormat(outputExt)
-            .on("end", resolve)
-            .on("error", reject)
-            .save(outputPath);
-        });
-        return cleanAndSend(res, outputPath, `converted.${outputExt}`);
-      }
-
-      // Documents
-      if (docFormats.includes(outputExt)) {
-        await new Promise((resolve, reject) => {
-          exec(`unoconv -f ${outputExt} -o ${outputPath} ${inputPath}`, err => {
-            if (err) reject(err);
-            else resolve();
-          });
-        });
-        return cleanAndSend(res, outputPath, `converted.${outputExt}`);
-      }
-
-      return res.status(400).json({ error: "Unsupported target format" });
+      await convertFile(inputPath, outputPath, targetFormat);
+    } else if (mode === "compress") {
+      await compressFile(inputPath, outputPath);
+    } else {
+      throw new Error("Invalid mode");
     }
 
-    // Compression
-    if (mode === "compress") {
-      // Images
-      if (imageFormats.includes(inputExt)) {
-        await sharp(inputPath).jpeg({ quality: 65 }).toFile(outputPath);
-        return cleanAndSend(res, outputPath, `compressed.${inputExt}`);
-      }
-
-      // Audio
-      if (audioFormats.includes(inputExt)) {
-        await new Promise((resolve, reject) => {
-          ffmpeg(inputPath)
-            .audioBitrate("128k")
-            .on("end", resolve)
-            .on("error", reject)
-            .save(outputPath);
-        });
-        return cleanAndSend(res, outputPath, `compressed.${inputExt}`);
-      }
-
-      // Video
-      if (videoFormats.includes(inputExt)) {
-        await new Promise((resolve, reject) => {
-          ffmpeg(inputPath)
-            .videoCodec("libx264")
-            .size("1280x720")
-            .videoBitrate("1000k")
-            .on("end", resolve)
-            .on("error", reject)
-            .save(outputPath);
-        });
-        return cleanAndSend(res, outputPath, `compressed.${inputExt}`);
-      }
-
-      // Documents
-      if (docFormats.includes(inputExt)) {
-        const zip = new JSZip();
-        zip.file(req.file.originalname, fs.readFileSync(inputPath));
-        const buffer = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
-        fs.writeFileSync(outputPath + ".zip", buffer);
-        fs.unlinkSync(inputPath);
-        return cleanAndSend(res, outputPath + ".zip", `compressed_${req.file.originalname}.zip`);
-      }
-
-      return res.status(400).json({ error: "Unsupported file for compression" });
-    }
-
-    return res.status(400).json({ error: "Invalid mode" });
+    res.download(outputPath, filename, () => {
+      fs.unlink(inputPath, () => {});
+      fs.unlink(outputPath, () => {});
+    });
   } catch (err) {
-    console.error("❌ Error:", err);
-    res.status(500).json({ error: err.message || "Processing failed" });
-  } finally {
-    fs.unlink(inputPath, () => {});
+    console.error("Conversion error:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
+async function convertFile(input, output, target) {
+  const ext = target.toLowerCase();
+
+  // Image conversions
+  if (["jpg", "jpeg", "png", "webp", "gif", "tiff", "bmp"].includes(ext)) {
+    await sharp(input).toFormat(ext).toFile(output);
+    return;
+  }
+
+  // Audio conversions
+  if (["mp3", "wav", "ogg", "aac", "flac"].includes(ext)) {
+    await new Promise((resolve, reject) => {
+      ffmpeg(input).toFormat(ext).on("end", resolve).on("error", reject).save(output);
+    });
+    return;
+  }
+
+  // Video conversions
+  if (["mp4", "avi", "mov", "webm", "mkv"].includes(ext)) {
+    await new Promise((resolve, reject) => {
+      ffmpeg(input).toFormat(ext).on("end", resolve).on("error", reject).save(output);
+    });
+    return;
+  }
+
+  // Document conversions
+  if (["pdf", "docx", "txt", "md", "html"].includes(ext)) {
+    await new Promise((resolve, reject) => {
+      exec(`unoconv -f ${ext} -o ${output} ${input}`, (err) => {
+        if (err) return reject(err);
+        resolve();
+      });
+    });
+    return;
+  }
+
+  throw new Error("Unsupported target format: " + ext);
+}
+
+async function compressFile(input, output) {
+  const ext = path.extname(input).toLowerCase();
+
+  if ([".jpg", ".jpeg", ".png", ".webp", ".gif"].includes(ext)) {
+    await sharp(input).jpeg({ quality: 60 }).toFile(output);
+    return;
+  }
+
+  if ([".mp3", ".wav", ".ogg", ".aac", ".flac"].includes(ext)) {
+    await new Promise((resolve, reject) => {
+      ffmpeg(input).audioBitrate("128k").on("end", resolve).on("error", reject).save(output);
+    });
+    return;
+  }
+
+  if ([".mp4", ".avi", ".mov", ".webm", ".mkv"].includes(ext)) {
+    await new Promise((resolve, reject) => {
+      ffmpeg(input)
+        .videoBitrate("1000k")
+        .size("?x720")
+        .on("end", resolve)
+        .on("error", reject)
+        .save(output);
+    });
+    return;
+  }
+
+  if ([".pdf", ".docx", ".txt", ".md", ".html"].includes(ext)) {
+    fs.copyFileSync(input, output);
+    return;
+  }
+
+  throw new Error("Unsupported compression format: " + ext);
+}
+
 module.exports = router;
-    
