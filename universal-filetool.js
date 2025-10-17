@@ -1,7 +1,6 @@
 // universal-filetool.js
-// Simple file conversion + compression backend with job status & download
-// Usage: node universal-filetool.js
-// Ensure ffmpeg is installed on the host for video/audio work.
+// Universal File Conversion + Compression Tool
+// Works as an Express sub-app integrated into server.js
 
 const express = require('express');
 const multer = require('multer');
@@ -20,18 +19,17 @@ app.use(express.json());
 const TMP_ROOT = path.join(__dirname, 'tmp_jobs');
 fs.ensureDirSync(TMP_ROOT);
 
-// Multer config - limit file size (e.g., 200MB)
 const upload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => cb(null, TMP_ROOT),
-    filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname.replace(/[^\w.\-]/g, '_')}`)
+    filename: (req, file, cb) =>
+      cb(null, `${Date.now()}-${file.originalname.replace(/[^\w.\-]/g, '_')}`)
   }),
   limits: { fileSize: 200 * 1024 * 1024 } // 200MB
 });
 
-const jobs = new Map(); // jobId -> metadata
+const jobs = new Map();
 
-// Utility
 function sanitizeFilename(name) {
   return name.replace(/[^\w.\-() ]+/g, '_');
 }
@@ -46,20 +44,22 @@ function setJobError(jobId, errMsg) {
   }
 }
 
-function scheduleCleanup(jobId, ms = 5 * 60 * 1000) { // default 5 minutes after done/error
+function scheduleCleanup(jobId, ms = 5 * 60 * 1000) {
   const job = jobs.get(jobId);
   if (!job) return;
   if (job.cleanupTimer) clearTimeout(job.cleanupTimer);
   job.cleanupTimer = setTimeout(async () => {
     try {
       await fs.remove(job.dir);
-    } catch (e) {}
+    } catch {}
     jobs.delete(jobId);
   }, ms);
 }
 
-// POST /api/upload?action=convert|compress&targetFormat=png|jpg|mp4|mp3...
-app.post('/api/upload', upload.single('file'), async (req, res) => {
+// === API Routes ===
+
+// POST /api/files/upload?action=convert|compress&targetFormat=png|mp3|mp4
+app.post('/upload', upload.single('file'), async (req, res) => {
   try {
     const action = (req.query.action || req.body.action || '').toLowerCase();
     const targetFormat = (req.query.targetFormat || req.body.targetFormat || '').toLowerCase();
@@ -94,7 +94,6 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
     };
     jobs.set(jobId, job);
 
-    // Start processing async
     processNext(job).catch(err => {
       console.error('Processing error', err);
       setJobError(jobId, String(err));
@@ -108,7 +107,7 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
   }
 });
 
-app.get('/api/status/:id', (req, res) => {
+app.get('/status/:id', (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: 'Job not found' });
   res.json({
@@ -121,12 +120,12 @@ app.get('/api/status/:id', (req, res) => {
   });
 });
 
-app.get('/api/download/:id', async (req, res) => {
+app.get('/download/:id', async (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: 'Job not found' });
-  if (job.status !== 'done' || !job.outputPath) return res.status(400).json({ error: 'Output not ready' });
+  if (job.status !== 'done' || !job.outputPath)
+    return res.status(400).json({ error: 'Output not ready' });
 
-  // Stream file and schedule cleanup
   const stat = await fs.stat(job.outputPath);
   res.setHeader('Content-Length', stat.size);
   const downloadName = job.outputFilename || path.basename(job.outputPath);
@@ -134,16 +133,12 @@ app.get('/api/download/:id', async (req, res) => {
   const readStream = fs.createReadStream(job.outputPath);
   readStream.pipe(res);
 
-  // After streaming completes, cleanup the job directory after a short delay
-  readStream.on('end', () => {
-    scheduleCleanup(job.id, 30 * 1000); // remove after 30s
-  });
-  readStream.on('error', () => {
-    scheduleCleanup(job.id, 30 * 1000);
-  });
+  readStream.on('end', () => scheduleCleanup(job.id, 30 * 1000));
+  readStream.on('error', () => scheduleCleanup(job.id, 30 * 1000));
 });
 
-// Processing logic
+// === Processing Logic ===
+
 async function processNext(job) {
   job.status = 'processing';
   job.progress = 5;
@@ -161,31 +156,20 @@ async function processNext(job) {
   try {
     if (job.action === 'convert') {
       if (!target) throw new Error('targetFormat is required for convert');
-      if (isImage) {
-        await convertImage(job, target);
-      } else if (isVideo || isAudio) {
-        await convertMediaWithFFMPEG(job, target);
-      } else {
-        throw new Error('Unsupported input type for convert');
-      }
+      if (isImage) await convertImage(job, target);
+      else if (isVideo || isAudio) await convertMediaWithFFMPEG(job, target);
+      else throw new Error('Unsupported input type for convert');
     } else if (job.action === 'compress') {
-      // Compression: for images we adjust quality; for video we'll set CRF
-      if (isImage) {
-        await compressImage(job, job.targetFormat); // targetFormat optional: use same ext
-      } else if (isVideo) {
-        await compressVideo(job);
-      } else {
-        throw new Error('Unsupported input type for compress');
-      }
-    } else {
-      throw new Error('Unknown action');
+      if (isImage) await compressImage(job, job.targetFormat);
+      else if (isVideo) await compressVideo(job);
+      else throw new Error('Unsupported input type for compress');
     }
 
     job.status = 'done';
     job.progress = 100;
     job.message = 'Done';
     job.updatedAt = Date.now();
-    scheduleCleanup(job.id, 5 * 60 * 1000);
+    scheduleCleanup(job.id);
   } catch (err) {
     console.error('Processing error', err);
     setJobError(job.id, String(err));
@@ -201,17 +185,11 @@ async function convertImage(job, targetFormat) {
   job.progress = 15;
   job.outputFilename = outName;
 
-  // Default to reasonable options; if converting to jpeg, set quality 85.
   let pipeline = sharp(job.inputPath);
-  if (['jpg', 'jpeg'].includes(targetFormat)) {
-    pipeline = pipeline.jpeg({ quality: 85 });
-  } else if (targetFormat === 'png') {
-    pipeline = pipeline.png({ compressionLevel: 8 });
-  } else if (targetFormat === 'webp') {
-    pipeline = pipeline.webp({ quality: 85 });
-  } else if (targetFormat === 'avif') {
-    pipeline = pipeline.avif({ quality: 50 });
-  }
+  if (['jpg', 'jpeg'].includes(targetFormat)) pipeline = pipeline.jpeg({ quality: 85 });
+  else if (targetFormat === 'png') pipeline = pipeline.png({ compressionLevel: 8 });
+  else if (targetFormat === 'webp') pipeline = pipeline.webp({ quality: 85 });
+  else if (targetFormat === 'avif') pipeline = pipeline.avif({ quality: 50 });
 
   await pipeline.toFile(outPath);
   job.outputPath = outPath;
@@ -221,7 +199,6 @@ async function convertImage(job, targetFormat) {
 }
 
 async function compressImage(job, preferredTarget) {
-  // compress image into same format or preferred target
   const ext = preferredTarget ? preferredTarget.replace(/^\./, '') : path.extname(job.inputPath).slice(1);
   const outName = path.basename(job.originalName, path.extname(job.originalName)) + '.' + ext;
   const outPath = path.join(job.dir, outName);
@@ -229,18 +206,11 @@ async function compressImage(job, preferredTarget) {
   job.progress = 20;
   job.outputFilename = outName;
 
-  // Heuristic: set quality lower than convert
   let pipeline = sharp(job.inputPath);
-  if (['jpg', 'jpeg'].includes(ext)) {
-    pipeline = pipeline.jpeg({ quality: 65 });
-  } else if (ext === 'png') {
-    pipeline = pipeline.png({ compressionLevel: 9 });
-  } else if (ext === 'webp') {
-    pipeline = pipeline.webp({ quality: 65 });
-  } else {
-    // fallback: re-encode to jpeg
-    pipeline = pipeline.jpeg({ quality: 65 });
-  }
+  if (['jpg', 'jpeg'].includes(ext)) pipeline = pipeline.jpeg({ quality: 65 });
+  else if (ext === 'png') pipeline = pipeline.png({ compressionLevel: 9 });
+  else if (ext === 'webp') pipeline = pipeline.webp({ quality: 65 });
+  else pipeline = pipeline.jpeg({ quality: 65 });
 
   await pipeline.toFile(outPath);
   job.outputPath = outPath;
@@ -251,7 +221,7 @@ async function compressImage(job, preferredTarget) {
 
 function convertMediaWithFFMPEG(job, targetFormat) {
   return new Promise((resolve, reject) => {
-    const targetExt = targetFormat.replace(/^\./, '') || (path.extname(job.inputPath).slice(1));
+    const targetExt = targetFormat.replace(/^\./, '') || path.extname(job.inputPath).slice(1);
     const outName = path.basename(job.originalName, path.extname(job.originalName)) + '.' + targetExt;
     const outPath = path.join(job.dir, outName);
     job.outputFilename = outName;
@@ -260,19 +230,14 @@ function convertMediaWithFFMPEG(job, targetFormat) {
     job.updatedAt = Date.now();
 
     const command = ffmpeg(job.inputPath)
-      .on('start', cmd => {
+      .on('start', () => {
         job.message = 'FFmpeg started';
         job.progress = 30;
         job.updatedAt = Date.now();
       })
       .on('progress', progress => {
-        // progress.percent isn't always available; derive an estimated percent
-        if (progress && progress.percent) {
+        if (progress && progress.percent)
           job.progress = Math.min(95, Math.floor(30 + progress.percent * 0.6));
-        } else {
-          job.progress = Math.min(90, job.progress + 2);
-        }
-        job.updatedAt = Date.now();
       })
       .on('end', () => {
         job.outputPath = outPath;
@@ -281,27 +246,21 @@ function convertMediaWithFFMPEG(job, targetFormat) {
         job.updatedAt = Date.now();
         resolve();
       })
-      .on('error', err => {
-        reject(err);
-      })
-      .outputOptions('-y'); // overwrite
-    // tune outputs based on extension
-    if (['mp4', 'mov', 'mkv', 'webm'].includes(targetExt)) {
-      // copy video codec if possible, otherwise transcode to libx264
+      .on('error', err => reject(err))
+      .outputOptions('-y');
+
+    if (['mp4', 'mov', 'mkv', 'webm'].includes(targetExt))
       command.videoCodec('libx264').audioCodec('aac').format(targetExt);
-    } else if (['mp3', 'wav', 'aac', 'ogg'].includes(targetExt)) {
+    else if (['mp3', 'wav', 'aac', 'ogg'].includes(targetExt))
       command.noVideo().audioCodec('libmp3lame').format(targetExt);
-    } else {
-      // fallback use container / try to transcode
-      command.format(targetExt);
-    }
+    else command.format(targetExt);
+
     command.save(outPath);
   });
 }
 
 function compressVideo(job) {
   return new Promise((resolve, reject) => {
-    const inPath = job.inputPath;
     const outName = path.basename(job.originalName, path.extname(job.originalName)) + '.mp4';
     const outPath = path.join(job.dir, outName);
     job.outputFilename = outName;
@@ -309,25 +268,13 @@ function compressVideo(job) {
     job.progress = 20;
     job.updatedAt = Date.now();
 
-    const command = ffmpeg(inPath)
+    ffmpeg(job.inputPath)
       .videoCodec('libx264')
       .audioCodec('aac')
-      .outputOptions([
-        '-preset veryfast',
-        '-crf 28', // higher crf -> smaller file, lower quality
-        '-movflags +faststart'
-      ])
-      .on('start', () => {
-        job.progress = 30;
-        job.updatedAt = Date.now();
-      })
+      .outputOptions(['-preset veryfast', '-crf 28', '-movflags +faststart'])
       .on('progress', p => {
-        if (p && p.percent) {
+        if (p && p.percent)
           job.progress = Math.min(95, Math.floor(30 + p.percent * 0.6));
-        } else {
-          job.progress = Math.min(90, job.progress + 3);
-        }
-        job.updatedAt = Date.now();
       })
       .on('end', () => {
         job.outputPath = outPath;
@@ -336,16 +283,11 @@ function compressVideo(job) {
         job.updatedAt = Date.now();
         resolve();
       })
-      .on('error', err => {
-        reject(err);
-      })
+      .on('error', reject)
       .save(outPath);
   });
 }
 
-//const PORT = process.env.PORT || 3000;
-//app.listen(PORT, () => {
-  //console.log(`Universal file tool server listening on port ${PORT}`);
-  //console.log(`Temporary job dir: ${TMP_ROOT}`);
-});
-         
+// Export as Express router app
+module.exports = app;
+                          
