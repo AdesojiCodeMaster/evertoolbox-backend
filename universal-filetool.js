@@ -238,13 +238,7 @@ else if ([".pdf", ".docx", ".txt", ".md", ".odt"].includes(inputExt)) {
   }
      }
   
-
-      else {
-        throw new Error("Unsupported file for conversion");
-      }
-    }
-
-    // ---------- SUCCESS ----------
+ // ---------- SUCCESS ----------
     res.download(output, outputFile, () => cleanup(input, output));
   } catch (err) {
     console.error("❌ Conversion failed:", err);
