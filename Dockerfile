@@ -1,6 +1,10 @@
+# ---- Base Node.js image ----
 FROM node:18-slim
 
-# Install dependencies: ffmpeg, unoconv, LibreOffice, and fonts
+# ---- Install conversion tools ----
+# ffmpeg for audio/video
+# libreoffice + unoconv for document conversions
+# fonts for proper PDF export
 RUN apt-get update && apt-get install -y \
   ffmpeg \
   libreoffice \
@@ -9,13 +13,16 @@ RUN apt-get update && apt-get install -y \
   fonts-dejavu-core \
   && apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# ---- App setup ----
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm install --production
+RUN npm ci --only=production
 
 COPY . .
 
+# ---- Expose port (Render uses this automatically) ----
 EXPOSE 10000
 
+# ---- Start the backend ----
 CMD ["node", "server.js"]
