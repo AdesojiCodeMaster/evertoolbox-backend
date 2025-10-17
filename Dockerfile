@@ -5,15 +5,16 @@ RUN apt-get update && apt-get install -y \
   ffmpeg \
   libreoffice \
   unoconv \
-  ghostscript \
   poppler-utils \
+  imagemagick \
+  ghostscript \
+  pandoc \
   python3 \
-  python3-pip \
-  libc6-dev \
-  libvips-dev \
   fonts-dejavu-core \
+  libvips-dev \
   && rm -rf /var/lib/apt/lists/*
 
+  
 WORKDIR /app
 COPY package*.json ./
 RUN npm install --production
