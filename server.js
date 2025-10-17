@@ -321,6 +321,8 @@ app.get('/api/temp/:id/:filename', (req, res) => {
 
 
 
+//==========≈=========================================================
+console.log("Current directory:", __dirname);
 //=====≈===============================================================
 const fileTool = require('./universal-filetool');
 app.use('/api/tools/file', fileTool);
