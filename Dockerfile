@@ -4,13 +4,14 @@ FROM node:18-bullseye
 # ---- Install conversion tools ----
 RUN apt-get update && apt-get install -y \
     ffmpeg \
-    imagemagick \
     libreoffice \
     unoconv \
-    poppler-utils \
     ghostscript \
-    && rm -rf /var/lib/apt/lists/*
-
+    poppler-utils \
+    python3 \
+    python3-pip \
+ && rm -rf /var/lib/apt/lists/*
+ 
 # ---- Set work directory ----
 WORKDIR /usr/src/app
 
