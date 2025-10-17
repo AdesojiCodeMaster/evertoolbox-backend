@@ -321,15 +321,19 @@ app.get('/api/temp/:id/:filename', (req, res) => {
 
 
 
-//==========≈=========================================================
-console.log("Current directory:", __dirname);
-//=====≈===============================================================
 const fileTool = require('./universal-filetool');
 app.use('/api/tools/file', fileTool);
 //const fileTool = require("./tools/universal-filetool");
 // mount the file tool router
 //app.use("/", fileTool);
 //=======≈=================================≈===========≈================
+
+
+
+
+//==========≈=========================================================
+console.log("Current directory:", __dirname);
+//=====≈===============================================================
 
 app._router.stack
   .filter(r => r.route)
