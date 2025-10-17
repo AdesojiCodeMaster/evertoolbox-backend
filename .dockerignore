@@ -1,0 +1,7 @@
+node_modules
+uploads
+processed
+.git
+*.log
+*.md
+.DS_Store
