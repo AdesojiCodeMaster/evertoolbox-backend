@@ -1,119 +1,143 @@
-//universal-filetool.js
+// universal-filetool.js
 const express = require("express");
 const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
 const sharp = require("sharp");
 const ffmpeg = require("fluent-ffmpeg");
-const { exec } = require("child_process");
 const PDFDocument = require("pdfkit");
+const { exec } = require("child_process");
 
-const upload = multer({ dest: "uploads/" });
 const router = express.Router();
 
-router.use(upload.single("file"));
+// Setup Multer
+const upload = multer({ dest: "uploads/" });
 
-router.post("/", async (req, res) => {
+// Utility function
+function cleanupFiles(...files) {
+  for (const f of files) {
+    if (fs.existsSync(f)) fs.unlinkSync(f);
+  }
+}
+
+// Main route
+router.post("/file", upload.single("file"), async (req, res) => {
   try {
-    const file = req.file;
-    const mode = req.body.mode;
-    const targetFormat = req.body.targetFormat;
-    const inputPath = file.path;
-    const filename = Date.now() + "." + (targetFormat || file.originalname.split(".").pop());
-    const outputPath = path.join("processed", filename);
+    const { targetFormat, action } = req.body;
+    const inputPath = req.file.path;
+    const inputExt = path.extname(req.file.originalname).toLowerCase();
+    const outputFile = `${Date.now()}.${targetFormat}`;
+    const outputPath = path.join("processed", outputFile);
 
-    if (!fs.existsSync("processed")) fs.mkdirSync("processed");
-
-    if (mode === "convert") {
-      await convertFile(inputPath, outputPath, targetFormat);
-    } else if (mode === "compress") {
-      await compressFile(inputPath, outputPath);
-    } else {
-      throw new Error("Invalid mode");
+    if (!targetFormat) {
+      cleanupFiles(inputPath);
+      return res.status(400).json({ error: "No target format specified" });
     }
 
-    res.download(outputPath, filename, () => {
-      fs.unlink(inputPath, () => {});
-      fs.unlink(outputPath, () => {});
-    });
+    // --- Handle compression ---
+    if (action === "compress") {
+      if ([".jpg", ".jpeg", ".png", ".webp", ".gif"].includes(inputExt)) {
+        await sharp(inputPath).jpeg({ quality: 60 }).toFile(outputPath);
+      } else if ([".mp3", ".wav", ".ogg"].includes(inputExt)) {
+        await new Promise((resolve, reject) => {
+          ffmpeg(inputPath)
+            .audioBitrate("128k")
+            .toFormat(inputExt.replace(".", ""))
+            .on("end", resolve)
+            .on("error", reject)
+            .save(outputPath);
+        });
+      } else if ([".mp4", ".avi", ".mov", ".webm"].includes(inputExt)) {
+        await new Promise((resolve, reject) => {
+          ffmpeg(inputPath)
+            .videoBitrate("800k")
+            .toFormat(inputExt.replace(".", ""))
+            .on("end", resolve)
+            .on("error", reject)
+            .save(outputPath);
+        });
+      } else {
+        cleanupFiles(inputPath);
+        return res.status(400).json({ error: "Unsupported compression type" });
+      }
+    }
+
+    // --- Handle conversions ---
+    else if (action === "convert") {
+      // IMAGE ↔ IMAGE
+      if ([".jpg", ".jpeg", ".png", ".webp", ".gif"].includes(inputExt)) {
+        // IMAGE → PDF (new)
+        if (targetFormat === "pdf") {
+          const doc = new PDFDocument({ autoFirstPage: false });
+          const stream = fs.createWriteStream(outputPath);
+          doc.pipe(stream);
+
+          const img = sharp(inputPath);
+          const metadata = await img.metadata();
+          const buffer = await img.toBuffer();
+
+          doc.addPage({ size: [metadata.width, metadata.height] });
+          doc.image(buffer, 0, 0, {
+            width: metadata.width,
+            height: metadata.height,
+          });
+          doc.end();
+
+          await new Promise((resolve) => stream.on("finish", resolve));
+        } else {
+          // IMAGE → IMAGE
+          await sharp(inputPath)
+            .toFormat(targetFormat)
+            .toFile(outputPath);
+        }
+      }
+
+      // AUDIO ↔ AUDIO
+      else if ([".mp3", ".wav", ".ogg"].includes(inputExt)) {
+        await new Promise((resolve, reject) => {
+          ffmpeg(inputPath)
+            .toFormat(targetFormat)
+            .on("end", resolve)
+            .on("error", reject)
+            .save(outputPath);
+        });
+      }
+
+      // VIDEO ↔ VIDEO
+      else if ([".mp4", ".avi", ".mov", ".webm"].includes(inputExt)) {
+        await new Promise((resolve, reject) => {
+          ffmpeg(inputPath)
+            .toFormat(targetFormat)
+            .on("end", resolve)
+            .on("error", reject)
+            .save(outputPath);
+        });
+      }
+
+      // DOCUMENT ↔ DOCUMENT (unoconv)
+      else if ([".pdf", ".docx", ".txt", ".md"].includes(inputExt)) {
+        await new Promise((resolve, reject) => {
+          exec(
+            `unoconv -f ${targetFormat} -o ${outputPath} ${inputPath}`,
+            (err) => (err ? reject(err) : resolve())
+          );
+        });
+      }
+
+      else {
+        cleanupFiles(inputPath);
+        return res.status(400).json({ error: "Unsupported conversion type" });
+      }
+    }
+
+    // Send success
+    cleanupFiles(inputPath);
+    return res.download(outputPath, outputFile, () => cleanupFiles(outputPath));
+
   } catch (err) {
-    console.error("Conversion error:", err);
-    res.status(500).json({ error: err.message });
+    console.error("❌ Conversion failed:", err);
+    return res.status(500).json({ error: "Conversion failed." });
   }
 });
-
-async function convertFile(input, output, target) {
-  const ext = target.toLowerCase();
-
-  // Image conversions
-  if (["jpg", "jpeg", "png", "webp", "gif", "tiff", "bmp"].includes(ext)) {
-    await sharp(input).toFormat(ext).toFile(output);
-    return;
-  }
-
-  // Audio conversions
-  if (["mp3", "wav", "ogg", "aac", "flac"].includes(ext)) {
-    await new Promise((resolve, reject) => {
-      ffmpeg(input).toFormat(ext).on("end", resolve).on("error", reject).save(output);
-    });
-    return;
-  }
-
-  // Video conversions
-  if (["mp4", "avi", "mov", "webm", "mkv"].includes(ext)) {
-    await new Promise((resolve, reject) => {
-      ffmpeg(input).toFormat(ext).on("end", resolve).on("error", reject).save(output);
-    });
-    return;
-  }
-
-  // Document conversions
-  if (["pdf", "docx", "txt", "md", "html"].includes(ext)) {
-    await new Promise((resolve, reject) => {
-      exec(`unoconv -f ${ext} -o ${output} ${input}`, (err) => {
-        if (err) return reject(err);
-        resolve();
-      });
-    });
-    return;
-  }
-
-  throw new Error("Unsupported target format: " + ext);
-}
-
-async function compressFile(input, output) {
-  const ext = path.extname(input).toLowerCase();
-
-  if ([".jpg", ".jpeg", ".png", ".webp", ".gif"].includes(ext)) {
-    await sharp(input).jpeg({ quality: 60 }).toFile(output);
-    return;
-  }
-
-  if ([".mp3", ".wav", ".ogg", ".aac", ".flac"].includes(ext)) {
-    await new Promise((resolve, reject) => {
-      ffmpeg(input).audioBitrate("128k").on("end", resolve).on("error", reject).save(output);
-    });
-    return;
-  }
-
-  if ([".mp4", ".avi", ".mov", ".webm", ".mkv"].includes(ext)) {
-    await new Promise((resolve, reject) => {
-      ffmpeg(input)
-        .videoBitrate("1000k")
-        .size("?x720")
-        .on("end", resolve)
-        .on("error", reject)
-        .save(output);
-    });
-    return;
-  }
-
-  if ([".pdf", ".docx", ".txt", ".md", ".html"].includes(ext)) {
-    fs.copyFileSync(input, output);
-    return;
-  }
-
-  throw new Error("Unsupported compression format: " + ext);
-}
 
 module.exports = router;
