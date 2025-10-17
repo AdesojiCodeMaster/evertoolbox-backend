@@ -1,28 +1,27 @@
 # ---- Base image ----
 FROM node:18-bullseye
 
-# ---- Install conversion tools ----
+# ---- System dependencies for conversions ----
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     libreoffice \
     unoconv \
     ghostscript \
     poppler-utils \
+    imagemagick \
     python3 \
     python3-pip \
  && rm -rf /var/lib/apt/lists/*
- 
-# ---- Set work directory ----
-WORKDIR /usr/src/app
 
-# ---- Copy project files ----
+# ---- App setup ----
+WORKDIR /app
 COPY package*.json ./
-RUN npm install --omit=dev
-
+RUN npm install --production
 COPY . .
 
-# ---- Expose Render port ----
-EXPOSE 10000
+# Ensure uploads/processed folders exist
+RUN mkdir -p uploads processed
 
-# ---- Start the unoconv listener + server ----
-CMD unoconv --listener & node server.js
+# ---- Expose and run ----
+EXPOSE 10000
+CMD ["node", "server.js"]
