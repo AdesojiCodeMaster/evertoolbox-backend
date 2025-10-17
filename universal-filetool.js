@@ -12,23 +12,30 @@ const router = express.Router();
 const upload = multer({ dest: "uploads/" });
 
 function cleanup(...files) {
-  for (const f of files) if (fs.existsSync(f)) fs.unlinkSync(f);
+  for (const f of files) {
+    try {
+      if (fs.existsSync(f)) fs.unlinkSync(f);
+    } catch {}
+  }
 }
 
 router.post("/file", upload.single("file"), async (req, res) => {
-  const { targetFormat, action } = req.body;
+  const { targetFormat, mode } = req.body;
   const input = req.file.path;
   const inputName = req.file.originalname;
   const inputExt = path.extname(inputName).toLowerCase();
-  const outputFile = `result_${Date.now()}.${targetFormat}`;
+  const baseName = `result_${Date.now()}`;
+  const outputFile = `${baseName}.${targetFormat || "bin"}`;
   const output = path.join("processed", outputFile);
 
   try {
-    if (action === "compress") {
-      // Simple compression
-      if (inputExt.match(/\.(jpg|jpeg|png|webp)$/)) {
+    fs.mkdirSync("processed", { recursive: true });
+
+    // ---------- COMPRESSION ----------
+    if (mode === "compress") {
+      if (inputExt.match(/\.(jpg|jpeg|png|webp|tiff|bmp|gif)$/)) {
         await sharp(input).jpeg({ quality: 60 }).toFile(output);
-      } else if (inputExt.match(/\.(mp4|avi|mov|webm)$/)) {
+      } else if (inputExt.match(/\.(mp4|avi|mov|webm|mkv)$/)) {
         await new Promise((resolve, reject) => {
           ffmpeg(input)
             .videoBitrate("800k")
@@ -36,44 +43,49 @@ router.post("/file", upload.single("file"), async (req, res) => {
             .on("error", reject)
             .save(output);
         });
+      } else if (inputExt.match(/\.(mp3|wav|ogg|aac|flac)$/)) {
+        await new Promise((resolve, reject) => {
+          ffmpeg(input)
+            .audioBitrate("96k")
+            .on("end", resolve)
+            .on("error", reject)
+            .save(output);
+        });
       } else {
-        cleanup(input);
-        return res.status(400).json({ error: "Unsupported file for compression" });
+        throw new Error("Unsupported file for compression");
       }
     }
 
-    else if (action === "convert") {
-      // --- IMAGE → PDF ---
+    // ---------- CONVERSION ----------
+    else if (mode === "convert") {
+      // IMAGE → PDF
       if (inputExt.match(/\.(jpg|jpeg|png|webp|bmp|tiff|gif)$/) && targetFormat === "pdf") {
-        const doc = new PDFDocument({ autoFirstPage: false });
-        const outStream = fs.createWriteStream(output);
-        doc.pipe(outStream);
-
         const img = sharp(input);
         const metadata = await img.metadata();
         const buffer = await img.toBuffer();
-
+        const doc = new PDFDocument({ autoFirstPage: false });
+        const outStream = fs.createWriteStream(output);
+        doc.pipe(outStream);
         doc.addPage({ size: [metadata.width, metadata.height] });
         doc.image(buffer, 0, 0, { width: metadata.width, height: metadata.height });
         doc.end();
-
-        await new Promise(r => outStream.on("finish", r));
+        await new Promise((r) => outStream.on("finish", r));
       }
 
-      // --- PDF → IMAGE ---
+      // PDF → IMAGE
       else if (inputExt === ".pdf" && ["jpg", "jpeg", "png", "webp"].includes(targetFormat)) {
         await new Promise((resolve, reject) => {
-          const cmd = `pdftoppm -${targetFormat} -singlefile "${input}" "${output.replace(/\.[^/.]+$/, '')}"`;
+          const cmd = `pdftoppm -${targetFormat} -singlefile "${input}" "${output.replace(/\.[^/.]+$/, "")}"`;
           exec(cmd, (err) => (err ? reject(err) : resolve()));
         });
       }
 
-      // --- IMAGE → IMAGE ---
+      // IMAGE → IMAGE
       else if (inputExt.match(/\.(jpg|jpeg|png|webp|bmp|tiff|gif)$/)) {
         await sharp(input).toFormat(targetFormat).toFile(output);
       }
 
-      // --- AUDIO/VIDEO ---
+      // AUDIO or VIDEO
       else if (inputExt.match(/\.(mp3|wav|ogg|aac|flac|mp4|avi|mov|webm|mkv)$/)) {
         await new Promise((resolve, reject) => {
           ffmpeg(input)
@@ -84,22 +96,21 @@ router.post("/file", upload.single("file"), async (req, res) => {
         });
       }
 
-      // --- DOCUMENTS (via unoconv) ---
+      // DOCUMENTS (unoconv)
       else if (inputExt.match(/\.(pdf|docx|txt|md|html)$/)) {
         await new Promise((resolve, reject) => {
-          exec(`unoconv -f ${targetFormat} -o "${output}" "${input}"`, (err) => {
-            if (err) reject(err);
-            else resolve();
-          });
+          exec(`unoconv -f ${targetFormat} -o "${output}" "${input}"`, (err) =>
+            err ? reject(err) : resolve()
+          );
         });
       }
 
       else {
-        cleanup(input);
-        return res.status(400).json({ error: "Unsupported conversion type" });
+        throw new Error("Unsupported file for conversion");
       }
     }
 
+    // ---------- SUCCESS ----------
     res.download(output, outputFile, () => cleanup(input, output));
   } catch (err) {
     console.error("❌ Conversion failed:", err);
