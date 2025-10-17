@@ -73,12 +73,14 @@ router.post("/file", upload.single("file"), async (req, res) => {
       }
 
       // PDF → IMAGE
-      else if (inputExt === ".pdf" && ["jpg", "jpeg", "png", "webp"].includes(targetFormat)) {
-        await new Promise((resolve, reject) => {
-          const cmd = `pdftoppm -${targetFormat} -singlefile "${input}" "${output.replace(/\.[^/.]+$/, "")}"`;
-          exec(cmd, (err) => (err ? reject(err) : resolve()));
-        });
+    else if (inputExt === ".pdf" && ["jpg", "jpeg", "png", "webp"].includes(targetFormat)) {
+    await new Promise((resolve, reject) => {
+    const formatFlag = targetFormat === "jpg" ? "jpeg" : targetFormat;
+    const cmd = `pdftoppm -${formatFlag} -singlefile "${input}" "${output.replace(/\.[^/.]+$/, '')}"`;
+    exec(cmd, (err) => (err ? reject(err) : resolve()));
+  });
       }
+        
 
       // IMAGE → IMAGE
       else if (inputExt.match(/\.(jpg|jpeg|png|webp|bmp|tiff|gif)$/)) {
