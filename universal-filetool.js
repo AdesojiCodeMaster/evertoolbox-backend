@@ -73,13 +73,88 @@ router.post("/file", upload.single("file"), async (req, res) => {
       }
 
       // PDF → IMAGE
-    else if (inputExt === ".pdf" && ["jpg", "jpeg", "png", "webp"].includes(targetFormat)) {
-    await new Promise((resolve, reject) => {
-    const formatFlag = targetFormat === "jpg" ? "jpeg" : targetFormat;
-    const cmd = `pdftoppm -${formatFlag} -singlefile "${input}" "${output.replace(/\.[^/.]+$/, '')}"`;
-    exec(cmd, (err) => (err ? reject(err) : resolve()));
+    // --- PDF -> IMAGE (robust) ---
+else if (inputExt === ".pdf" && ["jpg","jpeg","png","webp","gif","tiff","bmp"].includes(targetFormat)) {
+  await new Promise((resolve, reject) => {
+    try {
+      const tempBase = path.join("processed", `tmp_${Date.now()}`); // temp prefix
+      // step 1: create PNG from first page of PDF using pdftoppm (always available when poppler-utils is installed)
+      const cmd = `pdftoppm -png -singlefile "${input}" "${tempBase}"`;
+      exec(cmd, async (err) => {
+        if (err) {
+          console.error("pdftoppm error:", err);
+          return reject(err);
+        }
+
+        const tempPng = `${tempBase}.png`; // produced by pdftoppm
+        try {
+          // step 2: if target is png, just rename
+          if (targetFormat === "png") {
+            fs.renameSync(tempPng, output);
+            return resolve();
+          }
+
+          // step 3: use sharp to convert tempPng -> desired format
+          try {
+            const converter = sharp(tempPng);
+            // handle special cases or options per format if desired
+            if (targetFormat === "jpg" || targetFormat === "jpeg") {
+              await converter.jpeg({ quality: 90 }).toFile(output);
+            } else if (targetFormat === "webp") {
+              await converter.webp({ quality: 90 }).toFile(output);
+            } else if (targetFormat === "gif") {
+              // sharp can output GIF for single-frame images (non-animated)
+              // if sharp doesn't support GIF in your build, fallback to ImageMagick below
+              await converter.gif().toFile(output);
+            } else if (targetFormat === "tiff") {
+              await converter.tiff().toFile(output);
+            } else if (targetFormat === "bmp") {
+              await converter.raw().toBuffer().then(buf => {
+                // Sharp doesn't have .bmp() method; use toFile with .png then convert or use imagemagick fallback
+                // We'll try sharp's toFile with {raw} -> but simpler to use sharp to png then imagemagick convert if necessary.
+                // Here try sharp.png() -> then convert with imagemagick if available
+                const pngTempForBmp = `${tempBase}_intermediate.png`;
+                return converter.png().toFile(pngTempForBmp).then(async () => {
+                  // use imagemagick convert if present
+                  const convertCmd = `convert "${pngTempForBmp}" "${output}"`;
+                  exec(convertCmd, (convErr) => {
+                    try { fs.unlinkSync(pngTempForBmp); } catch(_) {}
+                    if (convErr) return reject(convErr);
+                    resolve();
+                  });
+                });
+              });
+              return; // exit early because conversion resolved inside
+            } else {
+              // fallback - try generic toFormat
+              await converter.toFile(output);
+            }
+
+            // remove tempPng and resolve
+            try { fs.unlinkSync(tempPng); } catch(_) {}
+            return resolve();
+          } catch (sharpErr) {
+            // If sharp failed for the requested format (e.g. GIF not supported), fallback to ImageMagick if installed
+            console.warn("sharp conversion failed, trying ImageMagick fallback:", sharpErr);
+            const targetExt = targetFormat;
+            const convertCmd = `convert "${tempPng}" "${output}"`;
+            exec(convertCmd, (convErr) => {
+              try { fs.unlinkSync(tempPng); } catch(_) {}
+              if (convErr) return reject(convErr);
+              return resolve();
+            });
+          }
+        } catch (innerErr) {
+          try { fs.unlinkSync(tempPng); } catch(_) {}
+          return reject(innerErr);
+        }
+      });
+    } catch (outerErr) {
+      return reject(outerErr);
+    }
   });
-      }
+}
+  
         
 
       // IMAGE → IMAGE
@@ -99,13 +174,70 @@ router.post("/file", upload.single("file"), async (req, res) => {
       }
 
       // DOCUMENTS (unoconv)
-      else if (inputExt.match(/\.(pdf|docx|txt|md|html)$/)) {
-        await new Promise((resolve, reject) => {
-          exec(`unoconv -f ${targetFormat} -o "${output}" "${input}"`, (err) =>
-            err ? reject(err) : resolve()
-          );
-        });
-      }
+      // --- DOCUMENT CONVERSIONS ---
+else if ([".pdf", ".docx", ".txt", ".md", ".odt"].includes(inputExt)) {
+  // Handle DOCX ↔ PDF via unoconv
+  if (
+    (inputExt === ".docx" && targetFormat === "pdf") ||
+    (inputExt === ".pdf" && targetFormat === "docx") ||
+    (inputExt === ".odt" && targetFormat === "pdf") ||
+    (inputExt === ".pdf" && targetFormat === "odt")
+  ) {
+    const cmd = `unoconv -f ${targetFormat} -o "${output}" "${input}"`;
+    await new Promise((resolve, reject) => {
+      exec(cmd, (err, stdout, stderr) => {
+        if (err) {
+          console.error("unoconv error:", stderr || err);
+          return reject(err);
+        }
+        resolve();
+      });
+    });
+  }
+
+  // Handle TXT ↔ PDF or MD ↔ PDF with pandoc
+  else if (
+    ([".txt", ".md"].includes(inputExt) && targetFormat === "pdf") ||
+    (inputExt === ".pdf" && ["txt", "md"].includes(targetFormat))
+  ) {
+    const cmd =
+      inputExt === ".pdf"
+        ? `pdftotext "${input}" "${output}"`
+        : `pandoc "${input}" -o "${output}"`;
+    await new Promise((resolve, reject) => {
+      exec(cmd, (err, stdout, stderr) => {
+        if (err) {
+          console.error("pandoc/pdftotext error:", stderr || err);
+          return reject(err);
+        }
+        resolve();
+      });
+    });
+  }
+
+  // Handle TXT ↔ DOCX or MD ↔ DOCX
+  else if (
+    ([".txt", ".md"].includes(inputExt) && targetFormat === "docx") ||
+    (inputExt === ".docx" && ["txt", "md"].includes(targetFormat))
+  ) {
+    const cmd = `pandoc "${input}" -o "${output}"`;
+    await new Promise((resolve, reject) => {
+      exec(cmd, (err, stdout, stderr) => {
+        if (err) {
+          console.error("pandoc error:", stderr || err);
+          return reject(err);
+        }
+        resolve();
+      });
+    });
+  }
+
+  // Fallback if unsupported combination
+  else {
+    throw new Error(`Unsupported document conversion: ${inputExt} → ${targetFormat}`);
+  }
+     }
+  
 
       else {
         throw new Error("Unsupported file for conversion");
