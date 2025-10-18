@@ -18,7 +18,7 @@ const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 const filetool = require("./universal-filetool");
 const { processFile } = require("./universal-filetool");
-const upload = multer({ dest: "uploads/" });
+
 
 
 
