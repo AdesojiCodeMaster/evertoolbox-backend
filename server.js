@@ -369,28 +369,3 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`EverToolbox backend listening on port ${PORT}`);
 });
-
-
-
-
-/* --- AUTO-CLEANER: remove old uploaded/processed files every 6 hours --- */
-const CLEAN_INTERVAL = 6 * 60 * 60 * 1000; // 6 hours
-const EXPIRY = 6 * 60 * 60 * 1000; // delete files older than 6 hours
-
-function cleanDir(dir) {
-  if (!fs.existsSync(dir)) return;
-  const now = Date.now();
-  fs.readdirSync(dir).forEach(file => {
-    const filePath = path.join(dir, file);
-    try {
-      const stats = fs.statSync(filePath);
-      if (now - stats.mtimeMs > EXPIRY) fs.unlinkSync(filePath);
-    } catch {}
-  });
-}
-
-setInterval(() => {
-  console.log("🧹 Cleaning old uploads...");
-  cleanDir("uploads");
-  cleanDir("processed");
-}, CLEAN_INTERVAL);
