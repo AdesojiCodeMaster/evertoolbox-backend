@@ -1,24 +1,18 @@
-FROM node:20-slim
+# Use official Node LTS image
+FROM node:18-slim
 
-# install all native tools
-RUN apt-get update && apt-get install -y \
-  ffmpeg \
-  libreoffice \
-  unoconv \
-  poppler-utils \
-  imagemagick \
-  ghostscript \
-  pandoc \
-  python3 \
-  fonts-dejavu-core \
-  libvips-dev \
-  && rm -rf /var/lib/apt/lists/*
-
-  
+# Create app directory
 WORKDIR /app
+
+# Copy package files and install
 COPY package*.json ./
 RUN npm install --production
+
+# Copy rest of the app
 COPY . .
 
-EXPOSE 3000
-CMD ["node", "server.js"]
+# Expose your app port
+EXPOSE 10000
+
+# Start command
+CMD ["npm", "start"]
