@@ -69,6 +69,8 @@ app.use("/api", (req, res) => {
 app.use((err, req, res, next) => {
   console.error("Global error:", err && err.stack ? err.stack : err);
   res.status(500).json({ error: "Internal server error" });
+});
+
 
 // --------------------
 // 1) SEO Analyzer
