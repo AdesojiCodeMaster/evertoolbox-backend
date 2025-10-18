@@ -1,9 +1,8 @@
-# Dockerfile for EverToolbox backend (Full Conversion Support)
-FROM node:18-bullseye
+# Use Node 20 instead of Node 18
+FROM node:20-bullseye
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install all needed system tools
 RUN apt-get update && apt-get install -y \
   ffmpeg \
   poppler-utils \
@@ -21,5 +20,4 @@ RUN npm install --production
 COPY . .
 
 EXPOSE 10000
-
 CMD ["node", "server.js"]
