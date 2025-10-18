@@ -1,18 +1,21 @@
-# Use official Node LTS image
+# Dockerfile - builds an environment with all system tools
 FROM node:18-slim
 
-# Create app directory
-WORKDIR /app
+ENV DEBIAN_FRONTEND=noninteractive
 
-# Copy package files and install
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  ffmpeg \
+  poppler-utils \
+  libreoffice \
+  unoconv \
+  imagemagick \
+  ghostscript \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
 COPY package*.json ./
 RUN npm install --production
-
-# Copy rest of the app
 COPY . .
 
-# Expose your app port
 EXPOSE 10000
-
-# Start command
-CMD ["npm", "start"]
+CMD ["node", "server.js"]
