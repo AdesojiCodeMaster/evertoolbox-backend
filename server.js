@@ -17,6 +17,14 @@ const googleTTS = require('google-tts-api'); // generate base64 audio
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 const filetool = require("./universal-filetool");
+const { processFile } = require("./universal-filetool");
+const upload = multer({ dest: "uploads/" });
+
+
+
+
+
+
 
 
 
@@ -330,7 +338,7 @@ app.get("/", (req, res) => {
 
 
 const fileTool = require('./universal-filetool');
-app.use('/api/tools', fileTool);
+app.use('/api/tools/file', fileTool);
 //=======≈=================================≈===========≈================
 
 
