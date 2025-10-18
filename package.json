@@ -5,8 +5,7 @@
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
-  "start": "node server.js",
-  "postinstall": "apt-get update && apt-get install -y poppler-utils ffmpeg libreoffice unoconv ghostscript"
+  "start": "node server.js"
   },
   "dependencies": {
     "archiver": "^5.3.1",
