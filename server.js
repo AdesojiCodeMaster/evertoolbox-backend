@@ -342,11 +342,34 @@ app.get("/", (req, res) => {
 
 
 const fileTool = require('./universal-filetool');
-app.use('/api/tools/file', fileTool);
+//app.use('/api/tools/file', fileTool);
 //=======≈=================================≈===========≈================
 
 
+// --- EverToolbox Universal File Tool Route (Standalone) ---
+app.post("/api/tools/file", upload.single("file"), async (req, res) => {
+  try {
+    const mode = req.body.mode || "convert";
+    const targetFormat = req.body.targetFormat;
+    const file = req.file;
 
+    if (!file) return res.status(400).json({ error: "No file uploaded" });
+    if (mode === "convert" && !targetFormat)
+      return res.status(400).json({ error: "No target format specified" });
+
+    const outputPath = await processFile(file, targetFormat, mode);
+    const filename = path.basename(outputPath);
+
+    res.download(outputPath, filename, () => {
+      fs.unlink(outputPath, () => {});
+      fs.unlink(file.path, () => {});
+    });
+  } catch (err) {
+    console.error("❌ Error during file processing:", err);
+    res.status(500).json({ error: "Conversion failed." });
+  }
+});
+  
 
 
 
