@@ -1,4 +1,4 @@
-FROM node:20-bullseye
+FROM node:20-slim
 
 # install all native tools
 RUN apt-get update && apt-get install -y \
