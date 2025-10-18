@@ -60,6 +60,16 @@ app.get('/', (req, res) => {
   res.send('EverToolbox Backend is running ✅');
 });
 
+// Generic 404 for other API routes
+app.use("/api", (req, res) => {
+  res.status(404).json({ error: "API endpoint not found." });
+});
+
+// Global error handler
+app.use((err, req, res, next) => {
+  console.error("Global error:", err && err.stack ? err.stack : err);
+  res.status(500).json({ error: "Internal server error" });
+
 // --------------------
 // 1) SEO Analyzer
 // GET /api/seo-analyze?url=<url>
@@ -355,7 +365,7 @@ app.use("/api/tools/file", universalFileTool);
 // --------------------
 // Start server
 // --------------------
-const PORT = process.env.PORT || 4000;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`EverToolbox backend listening on port ${PORT}`);
 });
