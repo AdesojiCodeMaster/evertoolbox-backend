@@ -60,16 +60,7 @@ app.get('/', (req, res) => {
   res.send('EverToolbox Backend is running ✅');
 });
 
-// Generic 404 for other API routes
-app.use("/api", (req, res) => {
-  res.status(404).json({ error: "API endpoint not found." });
-});
 
-// Global error handler
-app.use((err, req, res, next) => {
-  console.error("Global error:", err && err.stack ? err.stack : err);
-  res.status(500).json({ error: "Internal server error" });
-});
 
 
 // --------------------
@@ -360,7 +351,16 @@ app.use("/api/tools/file", universalFileTool);
 //=======≈=================================≈===========≈================
 
   
+// Generic 404 for other API routes
+app.use("/api", (req, res) => {
+  res.status(404).json({ error: "API endpoint not found." });
+});
 
+// Global error handler
+app.use((err, req, res, next) => {
+  console.error("Global error:", err && err.stack ? err.stack : err);
+  res.status(500).json({ error: "Internal server error" });
+});
 
 
 
