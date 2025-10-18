@@ -237,7 +237,7 @@ app.post('/api/convert-image', upload.single('file'), async (req, res) => {
 
     // convert format
     let outBuf;
-    if (format === 'jpeg' || format === 'jpg') {
+    if (format === 'jpeg' || format === 'jpg') { 
       outBuf = await sharp(buffer).jpeg({ quality: 90 }).toBuffer();
       res.type('jpeg');
     } else if (format === 'webp') {
@@ -341,8 +341,10 @@ app.get("/", (req, res) => {
 });
 
 
-const fileTool = require('./universal-filetool');
-app.use('/api/tools/file', fileTool);
+
+
+const universalFileTool = require("./universal-filetool");
+app.use("/api/tools/file", universalFileTool);
 //=======≈=================================≈===========≈================
 
   
