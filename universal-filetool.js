@@ -1,7 +1,7 @@
 // universal-filetool.js
-// CommonJS router — mount in server.js with:
-// const universal = require("./universal-filetool");
-// app.use("/api/tools/file", universal);
+// Exports an Express router mounted at /api/tools/file
+// Handles convert + compress modes with robust checks for system binaries.
+// Auto-cleans uploads/processed files after a few hours and via periodic sweep.
 
 const express = require("express");
 const multer = require("multer");
@@ -17,21 +17,26 @@ const archiver = require("archiver");
 
 const execP = util.promisify(exec);
 const router = express.Router();
-const upload = multer({ dest: "uploads/" });
 
-const processedDir = path.join(__dirname, "processed");
-if (!fs.existsSync(processedDir)) fs.mkdirSync(processedDir, { recursive: true });
+// storage directories (in repo root)
+const UPLOADS = path.join(__dirname, "uploads");
+const PROCESSED = path.join(__dirname, "processed");
 
-function safeUnlink(p) { try { if (p && fs.existsSync(p)) fs.unlinkSync(p);} catch(e){} }
+// ensure dirs
+if (!fs.existsSync(UPLOADS)) fs.mkdirSync(UPLOADS, { recursive: true });
+if (!fs.existsSync(PROCESSED)) fs.mkdirSync(PROCESSED, { recursive: true });
+
+// Multer
+const upload = multer({ dest: UPLOADS, limits: { fileSize: 1024 * 1024 * 300 } }); // 300MB max
+
+// Helper cleanup and utils
+const safeUnlink = (p) => { try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch(e){} };
+const safeStat = (p) => { try { return fs.statSync(p); } catch(e){ return null; } };
+
 function whichSync(cmd) {
-  try {
-    return !!execSync(`which ${cmd}`, { stdio: "ignore" });
-  } catch {
-    return false;
-  }
+  try { execSync(`which ${cmd}`, { stdio: "ignore" }); return true; } catch { return false; }
 }
 
-// Detect availability
 const HAS = {
   ffmpeg: whichSync("ffmpeg"),
   pdftoppm: whichSync("pdftoppm"),
@@ -40,7 +45,7 @@ const HAS = {
   convert: whichSync("convert") // ImageMagick
 };
 
-// Helper: respond with clear missing tools message
+// Provide missing-tools JSON
 function missingToolsResponse(res, tools) {
   return res.status(501).json({
     error: "Required system tools are missing for this conversion.",
@@ -49,217 +54,259 @@ function missingToolsResponse(res, tools) {
   });
 }
 
-// Utility to stream file download
-function sendAndCleanup(res, filePath, originalName) {
+// schedule deletion of a file after N milliseconds
+function scheduleDelete(filePath, ms = 1000 * 60 * 60 * 3) { // default 3 hours
+  setTimeout(() => { safeUnlink(filePath); }, ms);
+}
+
+// periodic sweep to delete old files older than threshold (ms)
+function periodicSweep(dir, olderThanMs = 1000 * 60 * 60 * 6) {
+  try {
+    const files = fs.readdirSync(dir);
+    const now = Date.now();
+    files.forEach(f => {
+      const p = path.join(dir, f);
+      const st = safeStat(p);
+      if (st && (now - st.mtimeMs) > olderThanMs) {
+        safeUnlink(p);
+      }
+    });
+  } catch (e) {
+    console.error("Sweep error:", e);
+  }
+}
+// run sweep every hour
+setInterval(() => {
+  periodicSweep(UPLOADS);
+  periodicSweep(PROCESSED);
+}, 1000 * 60 * 60);
+
+// helper to send a file and cleanup
+function sendAndCleanup(res, filePath, downloadName) {
   if (!fs.existsSync(filePath)) {
     return res.status(500).json({ error: "Output file not found." });
   }
-  const name = originalName || path.basename(filePath);
-  res.download(filePath, name, err => {
-    safeUnlink(filePath);
+  // set headers for download
+  const name = downloadName || path.basename(filePath);
+  res.download(filePath, name, (err) => {
+    if (err) console.error("Download error:", err);
+    // schedule deletion just in case
+    scheduleDelete(filePath, 1000 * 60 * 30); // 30 min
   });
 }
 
-// Main route (router is mounted at /api/tools/file or similar)
+// Main route: upload single file in field 'file'
 router.post("/", upload.single("file"), async (req, res) => {
-  const file = req.file;
-  if (!file) return res.status(400).json({ error: "No file uploaded." });
+  if (!req.file) return res.status(400).json({ error: "No file uploaded." });
 
   const mode = (req.body.mode || "convert").toLowerCase();
   const targetFormat = (req.body.targetFormat || "").toLowerCase();
-  const originalName = file.originalname;
-  const inputPath = file.path;
+  const originalName = req.file.originalname;
+  const inputPath = req.file.path;
   const inputExt = path.extname(originalName).slice(1).toLowerCase();
-
-  const nowbase = `result_${Date.now()}`;
+  const nowBase = `result_${Date.now()}`;
   const outputExt = targetFormat || inputExt;
-  const outputPath = path.join(processedDir, `${nowbase}.${outputExt}`);
+  const outputPath = path.join(PROCESSED, `${nowBase}.${outputExt}`);
 
   try {
-    // ========== COMPRESS MODE ==========
+    // ===== COMPRESS MODE =====
     if (mode === "compress") {
-      // Image compress via sharp (if image)
-      if (file.mimetype.startsWith("image/")) {
-        // choose output ext (keep same)
-        const q = parseInt(req.body.quality) || 75;
-        await sharp(inputPath).jpeg({ quality: q }).toFile(outputPath);
+      // Image compression via sharp
+      if (req.file.mimetype.startsWith("image/")) {
+        const quality = Math.max(30, Math.min(90, parseInt(req.body.quality || "75")));
+        // preserve requested output extension or same input
+        const outExt = (outputExt || inputExt) === "jpg" ? "jpeg" : (outputExt || inputExt);
+        await sharp(inputPath).toFormat(outExt === "jpeg" ? "jpeg" : outExt).jpeg({ quality }).toFile(outputPath);
         safeUnlink(inputPath);
+        scheduleDelete(outputPath);
         return sendAndCleanup(res, outputPath, `compressed_${originalName}`);
       }
 
-      // Audio/video compress requires ffmpeg
-      if (file.mimetype.startsWith("video/") || file.mimetype.startsWith("audio/")) {
+      // Audio/video compression needs ffmpeg
+      if (req.file.mimetype.startsWith("video/") || req.file.mimetype.startsWith("audio/")) {
         if (!HAS.ffmpeg) return missingToolsResponse(res, ["ffmpeg"]);
         await new Promise((resolve, reject) => {
-          ffmpeg(inputPath)
+          const proc = ffmpeg(inputPath)
             .outputOptions(["-b:v 800k", "-b:a 128k"])
+            .toFormat(outputExt || inputExt)
             .save(outputPath)
             .on("end", resolve)
             .on("error", reject);
         });
         safeUnlink(inputPath);
+        scheduleDelete(outputPath);
         return sendAndCleanup(res, outputPath, `compressed_${originalName}`);
       }
 
-      // Documents / others: return zip of single file (safe general compression)
+      // Other files: zip up
       const zipPath = outputPath.replace(/\.[^/.]+$/, ".zip");
-      const output = fs.createWriteStream(zipPath);
+      const outStream = fs.createWriteStream(zipPath);
       const archive = archiver("zip");
-      archive.pipe(output);
+      archive.pipe(outStream);
       archive.file(inputPath, { name: originalName });
       await archive.finalize();
       safeUnlink(inputPath);
+      scheduleDelete(zipPath);
       return sendAndCleanup(res, zipPath, `${path.basename(originalName)}.zip`);
     }
 
-    // ========== CONVERT MODE ==========
-    // IMAGE -> IMAGE via sharp
-    if (file.mimetype.startsWith("image/") && ["jpg","jpeg","png","webp","tiff","bmp","gif","pdf"].includes(outputExt)) {
+    // ===== CONVERT MODE =====
+    // IMAGE -> IMAGE or IMAGE -> PDF
+    if (req.file.mimetype.startsWith("image/") && ["jpg","jpeg","png","webp","tiff","bmp","gif","pdf"].includes(outputExt)) {
       if (outputExt === "pdf") {
-        // Image -> PDF (embed)
+        // embed image into PDF
         const pdfDoc = await PDFDocument.create();
         const imageBuf = fs.readFileSync(inputPath);
-        const ext = inputExt === "png" ? "png" : "jpg"; // pdf-lib supports embedJpg, embedPng
         let img;
-        if (ext === "png") img = await pdfDoc.embedPng(imageBuf); else img = await pdfDoc.embedJpg(imageBuf);
+        if (["png"].includes(inputExt)) img = await pdfDoc.embedPng(imageBuf);
+        else img = await pdfDoc.embedJpg(imageBuf);
         const page = pdfDoc.addPage([img.width, img.height]);
         page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
         const pdfBytes = await pdfDoc.save();
         fs.writeFileSync(outputPath, pdfBytes);
         safeUnlink(inputPath);
+        scheduleDelete(outputPath);
         return sendAndCleanup(res, outputPath, `${path.basename(originalName, path.extname(originalName))}.pdf`);
       } else {
-        // image -> image
-        await sharp(inputPath).toFormat(outputExt === "jpg" ? "jpeg" : outputExt).toFile(outputPath);
+        // image -> image via sharp
+        const fmt = outputExt === "jpg" ? "jpeg" : outputExt;
+        await sharp(inputPath).toFormat(fmt).toFile(outputPath);
         safeUnlink(inputPath);
+        scheduleDelete(outputPath);
         return sendAndCleanup(res, outputPath, `${path.basename(originalName, path.extname(originalName))}.${outputExt}`);
       }
     }
 
-    // PDF -> IMAGE(s): requires pdftoppm (poppler)
+    // PDF -> IMAGE via pdftoppm (poppler)
     if (inputExt === "pdf" && ["jpg","jpeg","png","webp","tiff","bmp"].includes(outputExt)) {
       if (!HAS.pdftoppm) return missingToolsResponse(res, ["pdftoppm (poppler-utils)"]);
-      // use pdftoppm -singlefile
-      const base = path.join(processedDir, nowbase);
+      const base = path.join(PROCESSED, nowBase);
       const flag = outputExt === "jpg" ? "jpeg" : outputExt;
       const cmd = `pdftoppm -${flag} -singlefile "${inputPath}" "${base}"`;
       await execP(cmd);
+      // pdftoppm produces base.[png/jpg/...]
       const produced = `${base}.${flag}`;
-      // if flag === 'jpeg', actual file is .jpg? pdftoppm uses extension 'jpg' for jpeg? we check
-      const finalProduced = fs.existsSync(produced) ? produced : `${base}.${outputExt}`;
+      if (!fs.existsSync(produced)) {
+        // try alternate extension
+        const alt = `${base}.${outputExt}`;
+        if (fs.existsSync(alt)) {
+          safeUnlink(inputPath);
+          scheduleDelete(alt);
+          return sendAndCleanup(res, alt, `${path.basename(originalName, ".pdf")}.${outputExt}`);
+        }
+        throw new Error("pdftoppm did not produce output.");
+      }
       safeUnlink(inputPath);
-      return sendAndCleanup(res, finalProduced, `${path.basename(originalName, ".pdf")}.${outputExt}`);
+      scheduleDelete(produced);
+      return sendAndCleanup(res, produced, `${path.basename(originalName, ".pdf")}.${outputExt}`);
     }
 
-    // IMAGE -> PDF handled above, covered.
+    // IMAGE -> PDF (covered above), IMAGE -> IMAGE covered.
 
-    // DOCX -> html/txt/pdf
+    // DOCX/ODT -> PDF/HTML/TXT via unoconv/libreoffice when available
     if (["doc","docx","odt"].includes(inputExt)) {
-      // If libreoffice/unoconv available, use it to convert to target format (pdf/docx/odt/txt/html)
       if (HAS.unoconv || HAS.libreoffice) {
-        // use unoconv if available, else libreoffice headless convert-to
-        const outName = path.join(processedDir, `${nowbase}.${outputExt}`);
+        // prefer unoconv
+        const expectedOut = path.join(PROCESSED, `${path.basename(inputPath, path.extname(inputPath))}.${outputExt}`);
         if (HAS.unoconv) {
-          const cmd = `unoconv -f ${outputExt} -o "${outName}" "${inputPath}"`;
+          const cmd = `unoconv -f ${outputExt} -o "${expectedOut}" "${inputPath}"`;
           await execP(cmd);
         } else {
-          const cmd = `libreoffice --headless --convert-to ${outputExt} "${inputPath}" --outdir "${processedDir}"`;
+          const cmd = `libreoffice --headless --convert-to ${outputExt} "${inputPath}" --outdir "${PROCESSED}"`;
           await execP(cmd);
         }
-        // LibreOffice/unoconv will name output after input; find the generated file
-        // Try expected produced
-        const produced = fs.existsSync(outName) ? outName :
-          path.join(processedDir, `${path.basename(inputPath, path.extname(inputPath))}.${outputExt}`);
+        // try to find produced file
+        const produced = fs.existsSync(expectedOut) ? expectedOut :
+                         path.join(PROCESSED, `${path.basename(inputPath, path.extname(inputPath))}.${outputExt}`);
+        if (!fs.existsSync(produced)) throw new Error("LibreOffice/unoconv did not produce output.");
         safeUnlink(inputPath);
-        if (!fs.existsSync(produced)) throw new Error("Conversion produced no output.");
+        scheduleDelete(produced);
         return sendAndCleanup(res, produced, `${path.basename(originalName, path.extname(originalName))}.${outputExt}`);
-      }
-      // Fallback: use mammoth to produce HTML/text (no PDF without libreoffice)
-      const buffer = fs.readFileSync(inputPath);
-      const { value: html } = await mammoth.convertToHtml({ buffer });
-      if (outputExt === "html") {
-        fs.writeFileSync(outputPath, html);
-        safeUnlink(inputPath);
-        return sendAndCleanup(res, outputPath, `${path.basename(originalName, path.extname(originalName))}.html`);
-      } else if (outputExt === "txt") {
-        const txt = html.replace(/<[^>]+>/g, "");
-        fs.writeFileSync(outputPath, txt);
-        safeUnlink(inputPath);
-        return sendAndCleanup(res, outputPath, `${path.basename(originalName, path.extname(originalName))}.txt`);
       } else {
-        // target requires PDF or other binary tool -> inform user
-        return missingToolsResponse(res, ["libreoffice/unoconv (required for DOCX→" + outputExt + ")"]);
+        // fallback: mammoth to HTML/TXT only
+        const buffer = fs.readFileSync(inputPath);
+        const { value: html } = await mammoth.convertToHtml({ buffer });
+        if (outputExt === "html") {
+          fs.writeFileSync(outputPath, html);
+          safeUnlink(inputPath);
+          scheduleDelete(outputPath);
+          return sendAndCleanup(res, outputPath, `${path.basename(originalName, path.extname(originalName))}.html`);
+        } else if (outputExt === "txt") {
+          const txt = html.replace(/<[^>]+>/g, "");
+          fs.writeFileSync(outputPath, txt);
+          safeUnlink(inputPath);
+          scheduleDelete(outputPath);
+          return sendAndCleanup(res, outputPath, `${path.basename(originalName, path.extname(originalName))}.txt`);
+        } else {
+          return missingToolsResponse(res, ["libreoffice/unoconv (required for DOCX→" + outputExt + ")"]);
+        }
       }
     }
 
-    // TXT/MD/HTML conversions — can provide text or require binary for PDF
+    // TXT/MD/HTML conversions
     if (["txt","md","html"].includes(inputExt)) {
       const content = fs.readFileSync(inputPath, "utf8");
-      if (outputExt === inputExt) {
-        fs.copyFileSync(inputPath, outputPath);
-        safeUnlink(inputPath);
-        return sendAndCleanup(res, outputPath, originalName);
-      }
       if (["txt","md","html"].includes(outputExt)) {
-        // simple transformation: for md->html we could use a markdown lib but keep simple
+        // simple pass-through or light md->html fallback
         if (inputExt === "md" && outputExt === "html") {
-          // minimal markdown -> html via replacing headers and newlines (light fallback)
-          const html = `<pre>${content}</pre>`;
-          fs.writeFileSync(outputPath, html);
+          const outHtml = `<pre>${content}</pre>`;
+          fs.writeFileSync(outputPath, outHtml);
           safeUnlink(inputPath);
+          scheduleDelete(outputPath);
           return sendAndCleanup(res, outputPath, `${path.basename(originalName, path.extname(originalName))}.html`);
         }
-        // plain copy fallback
         fs.writeFileSync(outputPath, content);
         safeUnlink(inputPath);
+        scheduleDelete(outputPath);
         return sendAndCleanup(res, outputPath, `${path.basename(originalName, path.extname(originalName))}.${outputExt}`);
       }
       if (outputExt === "pdf") {
-        // PDF production from HTML/TXT requires libreoffice or external renderer
         if (HAS.unoconv || HAS.libreoffice) {
-          const tmpHtml = path.join(processedDir, `${nowbase}.html`);
+          const tmpHtml = path.join(PROCESSED, `${nowBase}.html`);
           fs.writeFileSync(tmpHtml, inputExt === "html" ? content : `<pre>${content}</pre>`);
-          const outName = path.join(processedDir, `${nowbase}.pdf`);
+          const outPdf = path.join(PROCESSED, `${nowBase}.pdf`);
           if (HAS.unoconv) {
-            await execP(`unoconv -f pdf -o "${outName}" "${tmpHtml}"`);
+            await execP(`unoconv -f pdf -o "${outPdf}" "${tmpHtml}"`);
           } else {
-            await execP(`libreoffice --headless --convert-to pdf "${tmpHtml}" --outdir "${processedDir}"`);
+            await execP(`libreoffice --headless --convert-to pdf "${tmpHtml}" --outdir "${PROCESSED}"`);
           }
           safeUnlink(tmpHtml);
           safeUnlink(inputPath);
-          return sendAndCleanup(res, outName, `${path.basename(originalName, path.extname(originalName))}.pdf`);
+          scheduleDelete(outPdf);
+          return sendAndCleanup(res, outPdf, `${path.basename(originalName, path.extname(originalName))}.pdf`);
         } else {
-          return missingToolsResponse(res, ["libreoffice/unoconv (required for HTML/TXT→PDF)"]);
+          return missingToolsResponse(res, ["libreoffice/unoconv (required for TXT/HTML→PDF)"]);
         }
       }
     }
 
-    // AUDIO/VIDEO conversions require ffmpeg
-    if ((file.mimetype.startsWith("audio/") || file.mimetype.startsWith("video/")) &&
+    // AUDIO/VIDEO conversions
+    if ((req.file.mimetype.startsWith("audio/") || req.file.mimetype.startsWith("video/")) &&
         ["mp4","mp3","wav","ogg","webm","mkv","mov","avi"].includes(outputExt)) {
       if (!HAS.ffmpeg) return missingToolsResponse(res, ["ffmpeg"]);
-      // choose appropriate codec flags for webm vs mp4
       await new Promise((resolve, reject) => {
         const proc = ffmpeg(inputPath);
-        if (outputExt === "webm") proc.outputOptions(["-c:v libvpx-vp9 -c:a libopus"]);
-        else if (outputExt === "mp4") proc.outputOptions(["-c:v libx264 -c:a aac"]);
+        if (outputExt === "webm") proc.outputOptions(["-c:v libvpx-vp9 -b:v 1M -c:a libopus"]);
+        else if (outputExt === "mp4") proc.outputOptions(["-c:v libx264 -preset fast -c:a aac"]);
         proc.toFormat(outputExt).save(outputPath).on("end", resolve).on("error", reject);
       });
       safeUnlink(inputPath);
+      scheduleDelete(outputPath);
       return sendAndCleanup(res, outputPath, `${path.basename(originalName, path.extname(originalName))}.${outputExt}`);
     }
 
-    // Fallback generic copy (simulate conversion)
+    // Generic fallback: copy and return
     fs.copyFileSync(inputPath, outputPath);
     safeUnlink(inputPath);
+    scheduleDelete(outputPath);
     return sendAndCleanup(res, outputPath, `${path.basename(originalName, path.extname(originalName))}.${outputExt}`);
 
   } catch (err) {
-    console.error("Conversion error:", err);
+    console.error("Conversion error:", err && err.stack ? err.stack : err);
     safeUnlink(inputPath);
     return res.status(500).json({ error: "Conversion failed on server.", details: String(err) });
   }
 });
 
-// Export router
 module.exports = router;
+  
