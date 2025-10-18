@@ -12,120 +12,105 @@ const execPromise = util.promisify(exec);
 
 
 
+
+
 const router = express.Router();
 const upload = multer({ dest: "uploads/" });
 
-// Ensure processed folder exists
+// Ensure output folder
 if (!fs.existsSync("processed")) fs.mkdirSync("processed");
 
-// ✅ Helper for safe file cleanup
-const safeUnlink = (p) => fs.existsSync(p) && fs.unlinkSync(p);
+function safeUnlink(file) {
+  try { if (fs.existsSync(file)) fs.unlinkSync(file); } catch {}
+}
 
-// ✅ Utility to generate processed file path
-const outputFile = (ext) => path.join("processed", `result_${Date.now()}.${ext}`);
+router.post("/", upload.single("file"), (req, res) => {
+  const { mode, targetFormat } = req.body;
+  const file = req.file;
+  if (!file) return res.status(400).send("No file uploaded.");
 
-// ✅ Main route
-router.post("/", upload.single("file"), async (req, res) => {
+  const inputPath = file.path;
+  const inputName = file.originalname;
+  const inputExt = path.extname(inputName).slice(1).toLowerCase();
+  const outputExt = (targetFormat || inputExt).toLowerCase();
+  const baseOut = path.join("processed", `output_${Date.now()}`);
+  const outputPath = `${baseOut}.${outputExt}`;
+
+  let cmd = "";
+
   try {
-    const { mode, targetFormat } = req.body;
-    const inputFile = req.file.path;
-    const originalName = req.file.originalname;
-    const inputExt = path.extname(originalName).slice(1).toLowerCase();
-    const outputExt = (targetFormat || inputExt).toLowerCase();
-    const outputPath = outputFile(outputExt);
-
-    if (!inputFile) return res.status(400).send("No file uploaded.");
-
-    // ========== 🔹 COMPRESSION MODE ==========
+    // 🔹 COMPRESSION MODE
     if (mode === "compress") {
-      let cmd;
-      if (["jpg", "jpeg", "png", "webp"].includes(inputExt)) {
-        cmd = `convert "${inputFile}" -quality 75 "${outputPath}"`;
-      } else if (["mp4", "mov", "avi", "mkv", "webm"].includes(inputExt)) {
-        cmd = `ffmpeg -y -i "${inputFile}" -b:v 1M -b:a 128k "${outputPath}"`;
-      } else if (["mp3", "wav", "ogg", "flac", "aac"].includes(inputExt)) {
-        cmd = `ffmpeg -y -i "${inputFile}" -b:a 128k "${outputPath}"`;
-      } else if (["pdf"].includes(inputExt)) {
-        cmd = `gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/screen -dNOPAUSE -dQUIET -dBATCH -sOutputFile="${outputPath}" "${inputFile}"`;
-      } else {
-        safeUnlink(inputFile);
-        return res.status(400).send("Unsupported file type for compression.");
-      }
-
-      exec(cmd, (err) => {
-        safeUnlink(inputFile);
-        if (err) return res.status(500).send("Compression failed.");
-        res.download(outputPath, () => safeUnlink(outputPath));
-      });
-      return;
+      if (["jpg", "jpeg", "png", "webp"].includes(inputExt))
+        cmd = `convert "${inputPath}" -quality 75 "${outputPath}"`;
+      else if (["mp4", "mov", "avi", "mkv", "webm"].includes(inputExt))
+        cmd = `ffmpeg -y -i "${inputPath}" -b:v 1M -b:a 128k "${outputPath}"`;
+      else if (["mp3", "wav", "ogg", "flac", "aac"].includes(inputExt))
+        cmd = `ffmpeg -y -i "${inputPath}" -b:a 128k "${outputPath}"`;
+      else if (inputExt === "pdf")
+        cmd = `gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/screen -dNOPAUSE -dQUIET -dBATCH -sOutputFile="${outputPath}" "${inputPath}"`;
+      else throw new Error("Unsupported compression type");
     }
 
-    // ========== 🔹 CONVERSION MODE ==========
-    let cmd;
-
-    // ----- IMAGE CONVERSIONS -----
-    if (["jpg", "jpeg", "png", "webp", "tiff", "bmp", "gif"].includes(inputExt) &&
-        ["jpg", "jpeg", "png", "webp", "tiff", "bmp", "gif", "pdf"].includes(outputExt)) {
-      cmd = `convert "${inputFile}" "${outputPath}"`;
-    }
-
-    // ----- PDF → IMAGE -----
-    else if (inputExt === "pdf" && ["jpg", "jpeg", "png", "webp", "tiff", "bmp"].includes(outputExt)) {
-      const fmt = outputExt === "jpg" ? "jpeg" : outputExt;
-      cmd = `pdftoppm -${fmt} -singlefile "${inputFile}" "${outputPath.replace(/\.[^.]+$/, "")}"`;
-    }
-
-    // ----- DOCUMENT ↔ PDF -----
-    else if (["pdf", "doc", "docx", "odt", "txt", "html", "md"].includes(inputExt) &&
-             ["pdf", "docx", "odt", "txt", "html", "md"].includes(outputExt)) {
-      cmd = `libreoffice --headless --convert-to ${outputExt} "${inputFile}" --outdir processed`;
-    }
-
-    // ----- AUDIO ↔ AUDIO -----
-    else if (["mp3", "wav", "ogg", "flac", "aac"].includes(inputExt) &&
-             ["mp3", "wav", "ogg", "flac", "aac"].includes(outputExt)) {
-      cmd = `ffmpeg -y -i "${inputFile}" "${outputPath}"`;
-    }
-
-    // ----- VIDEO ↔ VIDEO -----
-    else if (["mp4", "mov", "avi", "mkv", "webm"].includes(inputExt) &&
-             ["mp4", "mov", "avi", "mkv", "webm"].includes(outputExt)) {
-      if (outputExt === "webm") {
-        cmd = `ffmpeg -y -i "${inputFile}" -c:v libvpx-vp9 -b:v 1M -c:a libopus "${outputPath}"`;
-      } else if (outputExt === "mp4") {
-        cmd = `ffmpeg -y -i "${inputFile}" -c:v libx264 -preset fast -c:a aac "${outputPath}"`;
-      } else {
-        cmd = `ffmpeg -y -i "${inputFile}" "${outputPath}"`;
-      }
-    }
-
+    // 🔹 CONVERSION MODE
     else {
-      safeUnlink(inputFile);
-      return res.status(400).send("Unsupported file conversion type.");
+      // IMAGE ↔ IMAGE
+      if (["jpg","jpeg","png","webp","tiff","bmp","gif"].includes(inputExt) &&
+          ["jpg","jpeg","png","webp","tiff","bmp","gif","pdf"].includes(outputExt))
+        cmd = `convert "${inputPath}" "${outputPath}"`;
+
+      // PDF → IMAGE
+      else if (inputExt === "pdf" && ["jpg","jpeg","png","webp","tiff","bmp"].includes(outputExt))
+        cmd = `pdftoppm -${outputExt === "jpg" ? "jpeg" : outputExt} -singlefile "${inputPath}" "${baseOut}"`;
+
+      // DOC ↔ PDF ↔ TXT
+      else if (["pdf","doc","docx","odt","txt","html","md"].includes(inputExt) &&
+               ["pdf","docx","odt","txt","html","md"].includes(outputExt))
+        cmd = `libreoffice --headless --convert-to ${outputExt} "${inputPath}" --outdir processed`;
+
+      // AUDIO ↔ AUDIO
+      else if (["mp3","wav","ogg","flac","aac"].includes(inputExt) &&
+               ["mp3","wav","ogg","flac","aac"].includes(outputExt))
+        cmd = `ffmpeg -y -i "${inputPath}" "${outputPath}"`;
+
+      // VIDEO ↔ VIDEO
+      else if (["mp4","mov","avi","mkv","webm"].includes(inputExt) &&
+               ["mp4","mov","avi","mkv","webm"].includes(outputExt)) {
+        if (outputExt === "webm")
+          cmd = `ffmpeg -y -i "${inputPath}" -c:v libvpx-vp9 -b:v 1M -c:a libopus "${outputPath}"`;
+        else if (outputExt === "mp4")
+          cmd = `ffmpeg -y -i "${inputPath}" -c:v libx264 -preset fast -c:a aac "${outputPath}"`;
+        else
+          cmd = `ffmpeg -y -i "${inputPath}" "${outputPath}"`;
+      } else throw new Error("Unsupported conversion type");
     }
 
+    // Execute conversion
     exec(cmd, (err) => {
+      safeUnlink(inputPath);
       if (err) {
-        console.error("❌ Conversion failed:", err);
-        safeUnlink(inputFile);
+        console.error("❌ Conversion error:", err);
         return res.status(500).send("Conversion failed.");
       }
 
-      // LibreOffice saves directly to processed/, so handle that
+      // Handle LibreOffice naming automatically
       if (cmd.includes("libreoffice")) {
-        const produced = path.join("processed", path.basename(originalName, path.extname(originalName)) + "." + outputExt);
-        res.download(produced, () => safeUnlink(produced));
-      } else {
-        res.download(outputPath, () => safeUnlink(outputPath));
+        const produced = path.join(
+          "processed",
+          path.basename(inputName, path.extname(inputName)) + "." + outputExt
+        );
+        return res.download(produced, () => safeUnlink(produced));
       }
-      safeUnlink(inputFile);
-    });
 
-  } catch (err) {
-    console.error(err);
-    return res.status(500).send("Server error during processing.");
+      const out = cmd.includes("pdftoppm") ? `${baseOut}.${outputExt}` : outputPath;
+      res.download(out, () => safeUnlink(out));
+    });
+  } catch (error) {
+    console.error(error);
+    safeUnlink(inputPath);
+    res.status(400).send("Invalid file or parameters.");
   }
 });
 
 module.exports = router;
-        
+  
