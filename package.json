@@ -35,7 +35,7 @@
     "path": "^0.12.7",
     "fs-extra": "^11.2.0",
      "mammoth": "^1.7.0",
-     "office-converter": "^2.0.0",
+     "office-converter": "^1.0.9",
     
     "pdf-parse": "^1.1.1"    
      },
