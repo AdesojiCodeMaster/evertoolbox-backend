@@ -5,7 +5,8 @@
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
-  "start": "node server.js"
+  "start": "node server.js",
+  "postinstall": "apt-get update && apt-get install -y poppler-utils ffmpeg libreoffice unoconv ghostscript"
   },
   "dependencies": {
     "archiver": "^5.3.1",
@@ -35,7 +36,7 @@
     "path": "^0.12.7",
     "fs-extra": "^11.2.0",
      "mammoth": "^1.7.0",
-     "office-converter": "^1.0.9",
+     "office-converter": "^2.0.0",
     
     "pdf-parse": "^1.1.1"    
      },
