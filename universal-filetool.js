@@ -1,190 +1,105 @@
+// universal-filetool.js
 const express = require("express");
 const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
-const util = require("util");
-const { exec, execSync } = require("child_process");
 const sharp = require("sharp");
-const ffmpeg = require("fluent-ffmpeg");
-const { PDFDocument } = require("pdf-lib");
-const mammoth = require("mammoth");
-const archiver = require("archiver");
+const { exec } = require("child_process");
 
-const execP = util.promisify(exec);
 const router = express.Router();
+const upload = multer({ dest: "uploads/" });
 
-const UPLOADS = path.join(__dirname, "uploads");
-const PROCESSED = path.join(__dirname, "processed");
-if (!fs.existsSync(UPLOADS)) fs.mkdirSync(UPLOADS, { recursive: true });
-if (!fs.existsSync(PROCESSED)) fs.mkdirSync(PROCESSED, { recursive: true });
-
-const upload = multer({ dest: UPLOADS, limits: { fileSize: 1024 * 1024 * 300 } });
-
-function whichSync(cmd) {
-  try { execSync(`which ${cmd}`, { stdio: "ignore" }); return true; }
-  catch { return false; }
-}
-const HAS = {
-  ffmpeg: whichSync("ffmpeg"),
-  pdftoppm: whichSync("pdftoppm"),
-  libreoffice: whichSync("libreoffice") || whichSync("soffice"),
-  unoconv: whichSync("unoconv"),
-  convert: whichSync("convert")
+// Make sure upload/output folders exist
+const ensureDir = (dir) => {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 };
+ensureDir("uploads");
+ensureDir("outputs");
 
-function missingToolsResponse(res, tools) {
-  return res.status(501).json({
-    error: "Required system tools are missing for this conversion.",
-    missing: tools
-  });
-}
+const log = (...msg) => console.log("[EverToolbox]", ...msg);
 
-function safeUnlink(p) { try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch {} }
-function safeStat(p) { try { return fs.statSync(p); } catch { return null; } }
-
-function scheduleDelete(filePath, ms = 1000 * 60 * 60 * 3) {
-  setTimeout(() => safeUnlink(filePath), ms);
-}
-
-function sendAndCleanup(res, filePath, downloadName) {
-  if (!fs.existsSync(filePath)) {
-    return res.status(500).json({ error: "Output file not found." });
+// Clean up temporary files
+function cleanup(paths = []) {
+  for (const p of paths) {
+    if (fs.existsSync(p)) fs.unlinkSync(p);
   }
-  const name = downloadName || path.basename(filePath);
-  const finalName = name.includes('.') ? name : name + path.extname(filePath);
-  res.download(filePath, finalName, (err) => {
-    if (err) console.error("Download error:", err);
-    scheduleDelete(filePath, 1000 * 60 * 30);
-  });
 }
 
-router.post("/", upload.single("file"), async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: "No file uploaded." });
-
-  const mode = (req.body.mode || "convert").toLowerCase();
-  const targetFormat = (req.body.targetFormat || "").toLowerCase();
-  const originalName = req.file.originalname;
-  const inputPath = req.file.path;
-  const inputExt = path.extname(originalName).slice(1).toLowerCase();
-  const nowBase = `result_${Date.now()}`;
-  const outputExt = targetFormat || inputExt;
-  const outputPath = path.join(PROCESSED, `${nowBase}.${outputExt}`);
-
-  // same format protection
-  if (mode === "convert" && inputExt === outputExt) {
-    safeUnlink(inputPath);
-    return res.status(400).json({ error: `File is already in ${outputExt.toUpperCase()} format.` });
-  }
-
+// MAIN ENDPOINT
+router.post("/file", upload.single("file"), async (req, res) => {
   try {
-    // ===== COMPRESS MODE =====
+    const { mode, targetFormat } = req.body;
+    const inputPath = req.file.path;
+    const ext = path.extname(req.file.originalname);
+    const base = path.basename(req.file.originalname, ext);
+    const outName = `${base}_${Date.now()}.${targetFormat || "zip"}`;
+    const outputPath = path.join("outputs", outName);
+
+    log("Request received:", { mode, targetFormat, file: req.file.originalname });
+
     if (mode === "compress") {
-      // Image compression
-      if (req.file.mimetype.startsWith("image/")) {
-        const quality = Math.max(20, Math.min(85, parseInt(req.body.quality || "60")));
-        await sharp(inputPath).jpeg({ quality }).toFile(outputPath);
-        const oldSize = fs.statSync(inputPath).size;
-        const newSize = fs.statSync(outputPath).size;
-        safeUnlink(inputPath);
-        scheduleDelete(outputPath);
-        return res.json({
-          message: "Image compressed successfully.",
-          originalSizeMB: (oldSize / 1024 / 1024).toFixed(2),
-          compressedSizeMB: (newSize / 1024 / 1024).toFixed(2),
-          download: `/api/tools/file/download/${path.basename(outputPath)}`
-        });
-      }
+      // compress images only
+      const buffer = await sharp(inputPath)
+        .jpeg({ quality: 70 })
+        .toBuffer();
+      fs.writeFileSync(outputPath, buffer);
+      log("Compression done:", outputPath);
 
-      // Audio/video compression
-      if (req.file.mimetype.startsWith("video/") || req.file.mimetype.startsWith("audio/")) {
-        if (!HAS.ffmpeg) return missingToolsResponse(res, ["ffmpeg"]);
+    } else if (mode === "convert") {
+      const mime = req.file.mimetype;
+
+      // Image conversion
+      if (mime.startsWith("image/")) {
+        await sharp(inputPath).toFormat(targetFormat).toFile(outputPath);
+        log("Image converted:", outputPath);
+
+      // PDF → image
+      } else if (mime === "application/pdf" && ["jpg", "jpeg", "png", "webp"].includes(targetFormat)) {
+        const baseOut = path.join("outputs", `${base}_${Date.now()}`);
+        const cmd = `pdftoppm -${targetFormat} "${inputPath}" "${baseOut}"`;
+        log("Running:", cmd);
+
         await new Promise((resolve, reject) => {
-          ffmpeg(inputPath)
-            .outputOptions(["-b:v 800k", "-b:a 96k"])
-            .save(outputPath)
-            .on("end", resolve).on("error", reject);
+          exec(cmd, (err) => (err ? reject(err) : resolve()));
         });
-        safeUnlink(inputPath);
-        scheduleDelete(outputPath);
-        return sendAndCleanup(res, outputPath, `compressed_${originalName}`);
-      }
 
-      // Other files → zip
-      const zipPath = outputPath.replace(/\.[^/.]+$/, ".zip");
-      const outStream = fs.createWriteStream(zipPath);
-      const archive = archiver("zip");
-      archive.pipe(outStream);
-      archive.file(inputPath, { name: originalName });
-      await archive.finalize();
-      safeUnlink(inputPath);
-      scheduleDelete(zipPath);
-      return sendAndCleanup(res, zipPath, `${path.basename(originalName)}.zip`);
-    }
+        // Find the first converted page
+        const files = fs.readdirSync("outputs").filter(f => f.startsWith(path.basename(baseOut)));
+        if (files.length === 0) throw new Error("Output file not found after conversion.");
+        const firstOutput = path.join("outputs", files[0]);
+        fs.renameSync(firstOutput, outputPath);
+        log("PDF converted:", outputPath);
 
-    // ===== CONVERT MODE =====
-    // IMAGE → PDF
-    if (req.file.mimetype.startsWith("image/") && outputExt === "pdf") {
-      const pdfDoc = await PDFDocument.create();
-      const imageBuf = fs.readFileSync(inputPath);
-      const img = await pdfDoc.embedJpg(imageBuf).catch(async () => await pdfDoc.embedPng(imageBuf));
-      const page = pdfDoc.addPage([img.width, img.height]);
-      page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
-      const pdfBytes = await pdfDoc.save();
-      fs.writeFileSync(outputPath, pdfBytes);
-      safeUnlink(inputPath);
-      scheduleDelete(outputPath);
-      return sendAndCleanup(res, outputPath, `${path.basename(originalName)}.pdf`);
-    }
+      // Audio/video conversion
+      } else if (mime.startsWith("audio/") || mime.startsWith("video/")) {
+        const cmd = `ffmpeg -y -i "${inputPath}" "${outputPath}"`;
+        log("Running:", cmd);
 
-    // PDF → IMAGE
-    if (inputExt === "pdf" && ["jpg", "jpeg", "png"].includes(outputExt)) {
-      if (!HAS.pdftoppm) return missingToolsResponse(res, ["pdftoppm (poppler-utils)"]);
-      const base = path.join(PROCESSED, nowBase);
-      await execP(`pdftoppm -${outputExt === "jpg" ? "jpeg" : outputExt} -singlefile "${inputPath}" "${base}"`);
-      const produced = `${base}.${outputExt === "jpg" ? "jpeg" : outputExt}`;
-      safeUnlink(inputPath);
-      scheduleDelete(produced);
-      return sendAndCleanup(res, produced, `${path.basename(originalName, ".pdf")}.${outputExt}`);
-    }
+        await new Promise((resolve, reject) => {
+          exec(cmd, (err) => (err ? reject(err) : resolve()));
+        });
 
-    // DOCX → PDF/TXT/HTML
-    if (["doc", "docx", "odt"].includes(inputExt)) {
-      if (HAS.unoconv || HAS.libreoffice) {
-        const cmd = HAS.unoconv
-          ? `unoconv -f ${outputExt} -o "${outputPath}" "${inputPath}"`
-          : `libreoffice --headless --convert-to ${outputExt} "${inputPath}" --outdir "${PROCESSED}"`;
-        await execP(cmd);
-        safeUnlink(inputPath);
-        scheduleDelete(outputPath);
-        return sendAndCleanup(res, outputPath, `${path.basename(originalName, path.extname(originalName))}.${outputExt}`);
+        if (!fs.existsSync(outputPath)) throw new Error("Output file not found after ffmpeg.");
+        log("Media converted:", outputPath);
+
       } else {
-        return missingToolsResponse(res, ["LibreOffice or unoconv"]);
+        throw new Error(`Unsupported conversion from ${mime} to ${targetFormat}`);
       }
+
+    } else {
+      throw new Error("Invalid mode");
     }
 
-    // AUDIO/VIDEO conversion
-    if ((req.file.mimetype.startsWith("audio/") || req.file.mimetype.startsWith("video/")) &&
-      ["mp4", "mp3", "wav", "ogg", "webm", "mkv"].includes(outputExt)) {
-      if (!HAS.ffmpeg) return missingToolsResponse(res, ["ffmpeg"]);
-      await new Promise((resolve, reject) => {
-        ffmpeg(inputPath).toFormat(outputExt).save(outputPath)
-          .on("end", resolve).on("error", reject);
-      });
-      safeUnlink(inputPath);
-      scheduleDelete(outputPath);
-      return sendAndCleanup(res, outputPath, `${path.basename(originalName, path.extname(originalName))}.${outputExt}`);
-    }
+    if (!fs.existsSync(outputPath)) throw new Error("Output file not found.");
 
-    // fallback
-    fs.copyFileSync(inputPath, outputPath);
-    safeUnlink(inputPath);
-    scheduleDelete(outputPath);
-    return sendAndCleanup(res, outputPath, `${path.basename(originalName)}.${outputExt}`);
+    res.download(outputPath, path.basename(outputPath), (err) => {
+      cleanup([inputPath, outputPath]);
+      if (err) log("Download error:", err.message);
+    });
 
   } catch (err) {
-    console.error("Conversion error:", err);
-    safeUnlink(inputPath);
-    return res.status(500).json({ error: "Conversion failed.", details: err.message });
+    log("Error:", err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
