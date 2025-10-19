@@ -1,25 +1,29 @@
-# Dockerfile for EverToolbox Universal File Tool
+# Dockerfile — EverToolbox Backend (Render-ready, Node 20 Slim)
 FROM node:20-slim
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    ffmpeg \
-    libreoffice \
-    ghostscript \
-    && rm -rf /var/lib/apt/lists/*
+ENV DEBIAN_FRONTEND=noninteractive
 
-# Set work directory
+# Install all needed system tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    poppler-utils \
+    libreoffice \
+    unoconv \
+    imagemagick \
+    ghostscript \
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
-# Copy package files and install dependencies
+# Copy only package files first (for caching)
 COPY package*.json ./
-RUN npm install
 
-# Copy application files
+# Install deps safely for production
+RUN npm install --omit=dev
+
+# Copy rest of your backend
 COPY . .
 
-# Expose backend port
 EXPOSE 10000
 
-# Start server
 CMD ["node", "server.js"]
