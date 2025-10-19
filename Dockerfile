@@ -1,34 +1,30 @@
-# -------------------------------------------------------
-# 🧩 EverToolbox Backend Dockerfile
-# -------------------------------------------------------
-# Designed for Render or any Node.js deployment
-# Simplicity, speed, and correctness — no folders/zips!
-# -------------------------------------------------------
+# Dockerfile - EverToolbox (production-ready)
+FROM node:20-bullseye
 
-# 1️⃣ Base image
-FROM node:20-alpine
-
-# 2️⃣ Create and set working directory
+ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
 
-# 3️⃣ Copy only dependency manifests first for caching
+# Install runtime tools required by backend conversion pipelines
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    ffmpeg \
+    poppler-utils \
+    libreoffice \
+    unoconv \
+    imagemagick \
+    ghostscript \
+    procps \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Copy package files and install dependencies (use npm install to avoid ci issues on some hosts)
 COPY package*.json ./
+RUN npm install --production
 
-# 3️⃣🅰️ make sure ffmpeg is installed inside the container:
-RUN apk add --no-cache ffmpeg
-
-# 4️⃣ Install only production dependencies
-# (npm ci requires a lock file — npm install works fine without)
-RUN npm install --omit=dev
-
-# 5️⃣ Copy the rest of the application
+# Copy application source
 COPY . .
 
-# 6️⃣ Expose the backend port (adjust if your server uses a different one)
-EXPOSE 5000
+# Expose the port (server.js is expected to honor process.env.PORT || 10000)
+EXPOSE 10000
 
-# 7️⃣ Environment setup for Render
-ENV NODE_ENV=production
-
-# 8️⃣ Start command
+# Start the server
 CMD ["node", "server.js"]
