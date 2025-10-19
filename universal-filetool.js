@@ -14,6 +14,7 @@ const mime = require("mime-types");
 
 const router = express.Router();
 const execPromise = util.promisify(exec);
+const ffmpeg = require('@dropb/ffmpeg');
 
 // ---- TEMP STORAGE ----
 const upload = multer({ dest: "uploads/" });
