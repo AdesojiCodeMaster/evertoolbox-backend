@@ -11,10 +11,13 @@ const path = require("path");
 const { exec } = require("child_process");
 const util = require("util");
 const mime = require("mime-types");
+const ffmpeg = require('fluent-ffmpeg');
+
+
 
 const router = express.Router();
 const execPromise = util.promisify(exec);
-const ffmpeg = require('@dropb/ffmpeg');
+
 
 // ---- TEMP STORAGE ----
 const upload = multer({ dest: "uploads/" });
