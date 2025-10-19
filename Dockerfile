@@ -1,30 +1,25 @@
-# Dockerfile - EverToolbox (production-ready)
-FROM node:20-bullseye
+# Dockerfile for EverToolbox Universal File Tool
+FROM node:20-slim
 
-ENV DEBIAN_FRONTEND=noninteractive
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    libreoffice \
+    ghostscript \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set work directory
 WORKDIR /app
 
-# Install runtime tools required by backend conversion pipelines
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    ffmpeg \
-    poppler-utils \
-    libreoffice \
-    unoconv \
-    imagemagick \
-    ghostscript \
-    procps \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
-
-# Copy package files and install dependencies (use npm install to avoid ci issues on some hosts)
+# Copy package files and install dependencies
 COPY package*.json ./
-RUN npm install --production
+RUN npm install
 
-# Copy application source
+# Copy application files
 COPY . .
 
-# Expose the port (server.js is expected to honor process.env.PORT || 10000)
+# Expose backend port
 EXPOSE 10000
 
-# Start the server
+# Start server
 CMD ["node", "server.js"]
