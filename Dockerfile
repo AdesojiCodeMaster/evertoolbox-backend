@@ -14,6 +14,9 @@ WORKDIR /app
 # 3️⃣ Copy only dependency manifests first for caching
 COPY package*.json ./
 
+# 3️⃣🅰️ make sure ffmpeg is installed inside the container:
+RUN apk add --no-cache ffmpeg
+
 # 4️⃣ Install only production dependencies
 # (npm ci requires a lock file — npm install works fine without)
 RUN npm install --omit=dev
