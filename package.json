@@ -27,7 +27,7 @@
     "libreoffice-convert": "^1.0.0",
     "adm-zip": "^0.5.10",
     "ffmpeg-static": "^5.2.0",
-    "fluent-ffmpeg": "^2.1.2",
+    "@dropb/ffmpeg": "^2.2.1",
     "pdf-lib": "^1.17.1",
     "jszip": "^3.10.1",
     "docx": "^9.0.3",
