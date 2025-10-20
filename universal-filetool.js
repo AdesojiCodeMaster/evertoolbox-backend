@@ -1,107 +1,78 @@
+// universal-filetool.js
 const express = require("express");
 const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
-const sharp = require("sharp");
 const { exec } = require("child_process");
 
 const router = express.Router();
 const upload = multer({ dest: "uploads/" });
 
-function ensureDir(dir) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-}
-ensureDir("uploads");
-ensureDir("outputs");
+// Helper: remove temp files safely
+const safeUnlink = (filePath) => {
+  fs.unlink(filePath, (err) => {
+    if (err) console.warn(`[WARN] Failed to delete ${filePath}:`, err.message);
+  });
+};
 
-function log(...args) {
-  console.log("[EverToolbox]", ...args);
-}
-
-function cleanup(files = []) {
-  for (const f of files) if (fs.existsSync(f)) fs.unlinkSync(f);
-}
-
+// POST /api/tools/file
 router.post("/file", upload.single("file"), async (req, res) => {
   try {
-    const { mode, targetFormat } = req.body;
-    const file = req.file;
-    if (!file) return res.status(400).json({ error: "No file uploaded" });
+    if (!req.file) return res.status(400).json({ error: "No file uploaded." });
 
-    const inputPath = file.path;
-    const ext = path.extname(file.originalname);
-    const base = path.basename(file.originalname, ext);
-    const outputPath = path.join("outputs", `${base}_${Date.now()}.${targetFormat || "zip"}`);
+    const mode = req.body.mode;
+    const targetFormat = req.body.targetFormat || "";
+    const inputPath = req.file.path;
+    const originalExt = path.extname(req.file.originalname);
+    const outputPath = path.join(
+      "outputs",
+      `${path.basename(req.file.originalname, originalExt)}_${Date.now()}.${targetFormat || "zip"}`
+    );
 
-    log(`Incoming ${mode} request for:`, file.originalname);
+    // Log incoming operation for visibility
+    console.log(`[EverToolbox] Mode: ${mode} | Target: ${targetFormat} | File: ${req.file.originalname}`);
 
-    if (mode === "compress") {
-      // Compress image
-      const buffer = await sharp(inputPath).jpeg({ quality: 70 }).toBuffer();
-      fs.writeFileSync(outputPath, buffer);
-      log("Compression completed:", outputPath);
+    fs.mkdirSync("outputs", { recursive: true });
+
+    let cmd = "";
+
+    if (mode === "convert") {
+      // Try ffmpeg or ImageMagick based on file type
+      if (req.file.mimetype.startsWith("image/")) {
+        cmd = `convert "${inputPath}" "${outputPath}"`;
+      } else if (req.file.mimetype.startsWith("video/") || req.file.mimetype.startsWith("audio/")) {
+        cmd = `ffmpeg -y -i "${inputPath}" "${outputPath}"`;
+      } else if (req.file.mimetype === "application/pdf" && targetFormat === "jpg") {
+        cmd = `magick convert "${inputPath}" "${outputPath}"`;
+      } else {
+        return res.status(400).json({ error: "Unsupported conversion type." });
+      }
+    } else if (mode === "compress") {
+      cmd = `zip -j "${outputPath}" "${inputPath}"`;
+    } else {
+      return res.status(400).json({ error: "Invalid mode." });
     }
 
-    else if (mode === "convert") {
-      const mime = file.mimetype;
+    exec(cmd, (err) => {
+      safeUnlink(inputPath);
 
-      // Convert images
-      if (mime.startsWith("image/")) {
-        await sharp(inputPath).toFormat(targetFormat).toFile(outputPath);
-        log("Image converted:", outputPath);
+      if (err) {
+        console.error("[EverToolbox] Conversion error:", err.message);
+        return res.status(500).json({ error: "Processing failed." });
       }
 
-      // Convert PDF -> image
-      else if (mime === "application/pdf" && ["jpg", "jpeg", "png", "webp"].includes(targetFormat)) {
-        const baseOut = path.join("outputs", `${base}_${Date.now()}`);
-        const cmd = `pdftoppm -${targetFormat} "${inputPath}" "${baseOut}"`;
-        log("Running:", cmd);
-
-        await new Promise((resolve, reject) => {
-          exec(cmd, (err) => (err ? reject(err) : resolve()));
-        });
-
-        const generated = fs.readdirSync("outputs").find(f => f.startsWith(path.basename(baseOut)));
-        if (!generated) throw new Error("Output file not found after PDF conversion");
-
-        fs.renameSync(path.join("outputs", generated), outputPath);
-        log("PDF converted:", outputPath);
+      if (!fs.existsSync(outputPath)) {
+        return res.status(500).json({ error: "Output file not found." });
       }
 
-      // Convert audio/video
-      else if (mime.startsWith("audio/") || mime.startsWith("video/")) {
-        const cmd = `ffmpeg -y -i "${inputPath}" "${outputPath}"`;
-        log("Running:", cmd);
-
-        await new Promise((resolve, reject) => {
-          exec(cmd, (err) => (err ? reject(err) : resolve()));
-        });
-
-        if (!fs.existsSync(outputPath)) throw new Error("Output file not found after ffmpeg conversion");
-        log("Media converted:", outputPath);
-      }
-
-      else {
-        throw new Error(`Unsupported conversion type: ${mime} -> ${targetFormat}`);
-      }
-    }
-
-    else {
-      throw new Error("Invalid mode");
-    }
-
-    if (!fs.existsSync(outputPath)) throw new Error("Output file not found.");
-
-    // Send file for download
-    res.download(outputPath, path.basename(outputPath), (err) => {
-      cleanup([inputPath, outputPath]);
-      if (err) log("Download error:", err.message);
+      console.log(`[EverToolbox] ✅ Completed: ${outputPath}`);
+      res.download(outputPath, path.basename(outputPath), () => safeUnlink(outputPath));
     });
-
-  } catch (err) {
-    log("Error:", err.message);
-    res.status(500).json({ error: err.message });
+  } catch (error) {
+    console.error("[EverToolbox] Internal error:", error);
+    res.status(500).json({ error: "Server error occurred." });
   }
 });
 
 module.exports = router;
+                                                                                 
