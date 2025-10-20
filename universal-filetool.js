@@ -15,6 +15,11 @@ function cleanup(dir) {
   fs.rm(dir, { recursive: true, force: true }, () => {});
 }
 
+
+router.get("/test", (req, res) => {
+  res.json({ message: "Universal FileTool API is live" });
+});
+
 // ===== API endpoint =====
 router.post("/api/tools/file", upload.single("file"), async (req, res) => {
   const { mode, targetFormat } = req.body;
