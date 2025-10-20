@@ -1,100 +1,102 @@
-// universal-filetool.js (CommonJS, Express Router)
-const express = require('express');
-const multer = require('multer');
-const fs = require('fs');
-const path = require('path');
-const sharp = require('sharp');
-const { exec } = require('child_process');
-
+// universal-filetool.js
+const express = require("express");
+const multer = require("multer");
+const fs = require("fs");
+const path = require("path");
+const { exec } = require("child_process");
+const util = require("util");
 const router = express.Router();
 
-// Create upload directory if it doesn’t exist
-const uploadDir = path.join(__dirname, 'uploads');
-fs.mkdirSync(uploadDir, { recursive: true });
+const execPromise = util.promisify(exec);
+const upload = multer({ dest: "uploads/" });
 
-const upload = multer({ dest: uploadDir });
+// ===== Helper for cleanup =====
+function cleanup(dir) {
+  fs.rm(dir, { recursive: true, force: true }, () => {});
+}
 
-// ------------------------------
-// Handle compression & conversion
-// POST /api/tools/file
-// ------------------------------
-router.post('/', upload.single('file'), async (req, res) => {
+// ===== API endpoint =====
+router.post("/api/tools/file", upload.single("file"), async (req, res) => {
+  const { mode, targetFormat } = req.body;
+  const file = req.file;
+
+  if (!file) return res.status(400).json({ error: "No file uploaded." });
+  if (mode !== "convert" && mode !== "compress")
+    return res.status(400).json({ error: "Invalid mode or missing format." });
+
+  const inputPath = path.resolve(file.path);
+  const ext = path.extname(file.originalname).toLowerCase();
+  const base = path.basename(file.originalname, ext);
+  const tempDir = path.join("temp", Date.now().toString());
+  fs.mkdirSync(tempDir, { recursive: true });
+
   try {
-    const { mode, format } = req.body;
-    const filePath = req.file?.path;
-    if (!filePath) {
-      return res.status(400).json({ error: 'No file uploaded' });
+    let outputPath = path.join(tempDir, `${base}.${targetFormat || "zip"}`);
+
+    // ---------- FILE CONVERSION ----------
+    if (mode === "convert") {
+      if (!targetFormat) throw new Error("Missing target format.");
+
+      // IMAGE → IMAGE
+      if ([".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff"].includes(ext)) {
+        await execPromise(`magick "${inputPath}" "${outputPath}"`);
+      }
+
+      // AUDIO → AUDIO
+      else if ([".mp3", ".wav", ".ogg", ".aac", ".flac", ".m4a"].includes(ext)) {
+        await execPromise(`ffmpeg -y -i "${inputPath}" "${outputPath}"`);
+      }
+
+      // VIDEO → VIDEO
+      else if ([".mp4", ".avi", ".mov", ".webm", ".mkv"].includes(ext)) {
+        await execPromise(`ffmpeg -y -i "${inputPath}" -preset medium -crf 23 "${outputPath}"`);
+      }
+
+      // PDF → IMAGE
+      else if (ext === ".pdf" && ["jpg", "jpeg", "png", "webp"].includes(targetFormat)) {
+        outputPath = path.join(tempDir, `${base}_page1.${targetFormat}`);
+        await execPromise(`magick -density 150 "${inputPath}[0]" -quality 90 "${outputPath}"`);
+      }
+
+      // DOCUMENT → DOCUMENT
+      else if ([".doc", ".docx", ".odt", ".html", ".txt", ".md", ".pdf"].includes(ext)) {
+        await execPromise(`libreoffice --headless --convert-to ${targetFormat} "${inputPath}" --outdir "${tempDir}"`);
+        const files = fs.readdirSync(tempDir);
+        outputPath = path.join(tempDir, files.find(f => f.startsWith(base)));
+      }
+
+      else {
+        throw new Error("Unsupported conversion type.");
+      }
+
+      // Return converted file
+      res.download(outputPath, err => cleanup(tempDir));
     }
 
-    // ---------- File Compression ----------
-    if (mode === 'compress') {
-      const compressedPath = `${filePath}.zip`;
-      const cmd = `zip -j -9 "${compressedPath}" "${filePath}"`;
-      exec(cmd, (err) => {
-        if (err) {
-          console.error('Compression error:', err);
-          return res.status(500).json({ error: 'Compression failed' });
-        }
-        res.download(compressedPath, path.basename(compressedPath), (errDown) => {
-          cleanupFiles([filePath, compressedPath]);
-        });
-      });
-      return;
+    // ---------- FILE COMPRESSION ----------
+    else if (mode === "compress") {
+      outputPath = path.join(tempDir, `${base}-compressed${ext}`);
+
+      if ([".png", ".jpg", ".jpeg", ".webp"].includes(ext)) {
+        await execPromise(`magick "${inputPath}" -strip -interlace Plane -quality 85 "${outputPath}"`);
+      } else if ([".mp4", ".mov", ".avi", ".webm", ".mkv"].includes(ext)) {
+        await execPromise(`ffmpeg -y -i "${inputPath}" -vcodec libx264 -crf 28 "${outputPath}"`);
+      } else if ([".mp3", ".wav", ".ogg", ".aac", ".flac"].includes(ext)) {
+        await execPromise(`ffmpeg -y -i "${inputPath}" -b:a 128k "${outputPath}"`);
+      } else if (ext === ".pdf") {
+        await execPromise(`gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/ebook -dNOPAUSE -dQUIET -dBATCH -sOutputFile="${outputPath}" "${inputPath}"`);
+      } else {
+        throw new Error("Unsupported compression format.");
+      }
+
+      res.download(outputPath, err => cleanup(tempDir));
     }
-
-    // ---------- Image Conversion ----------
-    if (mode === 'convert' && format) {
-      const targetFormat = format.toLowerCase();
-      const outputPath = `${filePath}.${targetFormat}`;
-      const img = sharp(filePath);
-
-      await img.toFormat(targetFormat).toFile(outputPath);
-
-      res.download(outputPath, `converted.${targetFormat}`, (errDown) => {
-        cleanupFiles([filePath, outputPath]);
-      });
-      return;
-    }
-
-    // ---------- Document Conversion (PDF <-> DOCX etc.) ----------
-    if (mode === 'convert-doc' && format) {
-      const target = format.replace(/^\./, '');
-      const outDir = path.dirname(filePath);
-      const cmd = `soffice --headless --convert-to ${target} --outdir ${outDir} ${filePath}`;
-      exec(cmd, (err, stdout, stderr) => {
-        if (err) {
-          console.error('LibreOffice conversion error:', stderr);
-          cleanupFiles([filePath]);
-          return res.status(500).json({ error: 'Document conversion failed. Ensure LibreOffice is installed.' });
-        }
-        const outputFile = filePath.replace(/\.[^/.]+$/, `.${target}`);
-        res.download(outputFile, path.basename(outputFile), () => {
-          cleanupFiles([filePath, outputFile]);
-        });
-      });
-      return;
-    }
-
-    // ---------- Invalid mode ----------
-    return res.status(400).json({ error: 'Invalid mode or missing format.' });
   } catch (err) {
-    console.error('File tool error:', err);
-    res.status(500).json({ error: 'File processing failed' });
+    console.error("Processing error:", err.message);
+    res.status(500).json({ error: "File processing failed" });
+  } finally {
+    fs.unlink(file.path, () => {});
   }
 });
 
-// ------------------------------
-// Helper: Cleanup files
-// ------------------------------
-function cleanupFiles(files) {
-  files.forEach(f => {
-    try {
-      if (f && fs.existsSync(f)) fs.unlinkSync(f);
-    } catch (e) {
-      console.error('Cleanup error:', e);
-    }
-  });
-}
-
 module.exports = router;
-        
