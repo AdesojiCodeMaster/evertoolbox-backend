@@ -93,14 +93,24 @@ async function convertImage(inputPath, outPath, targetExt, magickCmd) {
   const inExt = extOfFilename(inputPath);
   const isPdfSource = inExt === "pdf";
   const density = 150; // resolution for PDF->image
-  // Build command
-  // Example: magick input.pdf[0] -quality 85 output.jpg
-  const quality = 85;
+  const quality = 90;
+
   const src = isPdfSource ? `${inputPath}[0]` : inputPath;
-  const cmd = `${magickCmd} "${src}" -strip -quality ${quality} "${outPath}"`;
+
+  // Decide if target format needs white background (JPG, JPEG, BMP, WEBP, GIF)
+  const needsWhiteBg = ["jpg", "jpeg", "bmp", "webp", "gif"].includes(targetExt.toLowerCase());
+  const bgOption = needsWhiteBg
+    ? "-background white -alpha remove -alpha off -flatten"
+    : "";
+
+  // Build full ImageMagick command
+  // Example: magick input.pdf[0] -background white -alpha remove -alpha off -flatten -strip -quality 90 output.jpg
+  const cmd = `${magickCmd} "${src}" ${bgOption} -strip -quality ${quality} "${outPath}"`;
+
   await runCmd(cmd);
   return outPath;
 }
+
 
 async function convertImageToPdf(inputPath, outPath, magickCmd) {
   // Convert image to PDF
