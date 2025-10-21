@@ -129,45 +129,54 @@ async function compressImage(inputPath, outPath, targetExt, magickCmd) {
 }
 
 async function convertAudio(inputPath, outPath, targetExt) {
-  // Map to safe and compatible ffmpeg audio encoders
-  let codec = "libmp3lame";
-  let extra = "";
+  // Ensure targetExt is lowercase without dot
+  targetExt = targetExt.replace('.', '').toLowerCase();
+
+  // Determine codec and settings
+  let codec = 'libmp3lame';
+  let extra = '';
 
   switch (targetExt) {
-    case "ogg":
-      codec = "libvorbis";
-      // ✅ Force resample, stereo, and safe bitrate — fixes encoder setup errors
-      extra = "-ar 44100 -ac 2 -b:a 128k";
+    case 'ogg':
+      codec = 'libvorbis';
+      extra = '-ar 44100 -ac 2 -b:a 128k';
       break;
-    case "mp3":
-      codec = "libmp3lame";
-      extra = "-b:a 192k";
+    case 'mp3':
+      codec = 'libmp3lame';
+      extra = '-b:a 192k';
       break;
-    case "aac":
-      codec = "aac";
-      extra = "-b:a 192k";
+    case 'aac':
+      codec = 'aac';
+      extra = '-b:a 192k';
       break;
-    case "wav":
-      codec = "pcm_s16le";
+    case 'wav':
+      codec = 'pcm_s16le';
       break;
-    case "flac":
-      codec = "flac";
+    case 'flac':
+      codec = 'flac';
       break;
   }
 
-  const cmd = `ffmpeg -y -i "${inputPath}" -vn -acodec ${codec} ${extra} "${outPath}"`;
+  // ✅ Ensure the output file has the proper extension
+  const correctOutPath = outPath.endsWith(`.${targetExt}`)
+    ? outPath
+    : `${outPath}.${targetExt}`;
+
+  // Run ffmpeg with overwrite and no video
+  const cmd = `ffmpeg -y -i "${inputPath}" -vn -acodec ${codec} ${extra} "${correctOutPath}"`;
   await runCmd(cmd);
 
-  // ✅ Ensure file has proper extension
-  const fileExt = path.extname(outPath);
-  if (!fileExt || fileExt.replace(".", "") !== targetExt) {
-    const fixedPath = `${outPath}.${targetExt}`;
-    await fsp.rename(outPath, fixedPath);
-    return fixedPath;
+  // Double-check file exists and rename if necessary
+  try {
+    await fsp.access(correctOutPath);
+    return correctOutPath;
+  } catch {
+    const fallback = `${outPath}.${targetExt}`;
+    await fsp.rename(outPath, fallback).catch(() => {});
+    return fallback;
   }
-
-  return outPath;
 }
+
 
 
 async function compressAudio(inputPath, outPath) {
