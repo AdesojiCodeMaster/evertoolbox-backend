@@ -1,32 +1,37 @@
-# ---------- EverToolbox Backend Dockerfile (Render Ready) ----------
+# ---------- BASE IMAGE ----------
 FROM node:20-slim
 
-WORKDIR /app
-
-# Install all required system tools for conversions and compression
-RUN apt-get update && apt-get install -y \
+# ---------- SYSTEM DEPENDENCIES ----------
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     imagemagick \
     ghostscript \
     libreoffice \
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
-# --- FIX: Allow ImageMagick to read PDF/PS files ---
-# Render blocks PDF conversions by default, so we patch the policy.xml
-RUN sed -i 's/rights="none" pattern="PDF"/rights="read|write" pattern="PDF"/g' /etc/ImageMagick-6/policy.xml || true
-RUN sed -i 's/rights="none" pattern="PS"/rights="read|write" pattern="PS"/g' /etc/ImageMagick-6/policy.xml || true
+# ---------- SECURITY POLICY FIX ----------
+# Allow ImageMagick to read PDFs (Render sometimes restricts it)
+RUN sed -i 's|<policy domain="coder" rights="none" pattern="PDF" />|<policy domain="coder" rights="read|write" pattern="PDF" />|' /etc/ImageMagick-6/policy.xml || true
 
-# Copy package definition files
+# ---------- WORKDIR & APP SETUP ----------
+WORKDIR /app
+
+# Copy dependency files
 COPY package*.json ./
 
-# Install only production dependencies (no dev)
+# Install npm dependencies
 RUN npm install --omit=dev
 
-# Copy the entire project (backend + universal-filetool.js + everything else)
+# Copy the rest of the app
 COPY . .
 
-# Expose backend port (Render uses 10000 by default)
+# ---------- ENVIRONMENT ----------
+ENV NODE_ENV=production
+ENV PORT=10000
+
+# ---------- PORT ----------
 EXPOSE 10000
 
-# Start the Node.js backend
+# ---------- START COMMAND ----------
 CMD ["node", "server.js"]
