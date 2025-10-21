@@ -3,7 +3,8 @@
 # Supports PDF↔Image, Audio, Video, Office docs, etc.
 # ------------------------------------------------------------
 
-FROM node: 20-bullseye
+FROM node:20-bullseye
+
 
 # Create app directory
 WORKDIR /app
