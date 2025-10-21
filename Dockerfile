@@ -1,37 +1,38 @@
-# ---------- BASE IMAGE ----------
-FROM node:20-slim
+# ------------------------------------------------------------
+# 🧰 EverToolbox Backend Dockerfile (Render-ready)
+# Supports PDF↔Image, Audio, Video, Office docs, etc.
+# ------------------------------------------------------------
 
-# ---------- SYSTEM DEPENDENCIES ----------
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    imagemagick \
-    ghostscript \
-    libreoffice \
-    fonts-dejavu-core \
-    && rm -rf /var/lib/apt/lists/*
+FROM node: 20-bullseye
 
-# ---------- SECURITY POLICY FIX ----------
-# Allow ImageMagick to read PDFs (Render sometimes restricts it)
-RUN sed -i 's|<policy domain="coder" rights="none" pattern="PDF" />|<policy domain="coder" rights="read|write" pattern="PDF" />|' /etc/ImageMagick-6/policy.xml || true
-
-# ---------- WORKDIR & APP SETUP ----------
+# Create app directory
 WORKDIR /app
 
-# Copy dependency files
+# Install required system dependencies
+# Includes: ffmpeg, ImageMagick, Ghostscript, LibreOffice
+RUN apt-get update && \
+    apt-get install -y ffmpeg imagemagick ghostscript libreoffice && \
+    # ✅ Fix ImageMagick security policy for PDF conversion
+    sed -i 's/<policy domain="coder" rights="none" pattern="PDF" \/>/<policy domain="coder" rights="read|write" pattern="PDF" \/>/' /etc/ImageMagick-6/policy.xml || true && \
+    sed -i 's/<policy domain="coder" rights="none" pattern="PDF" \/>/<policy domain="coder" rights="read|write" pattern="PDF" \/>/' /etc/ImageMagick-7/policy.xml || true && \
+    # Clean up
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Copy package files
 COPY package*.json ./
 
-# Install npm dependencies
-RUN npm install --omit=dev
+# Install Node.js dependencies
+RUN npm install --production
 
-# Copy the rest of the app
+# Copy the entire backend source code
 COPY . .
 
-# ---------- ENVIRONMENT ----------
-ENV NODE_ENV=production
-ENV PORT=10000
-
-# ---------- PORT ----------
+# Expose port (Render automatically detects this)
 EXPOSE 10000
 
-# ---------- START COMMAND ----------
+# Define environment variables if needed
+ENV PORT=10000
+ENV NODE_ENV=production
+
+# Start your server
 CMD ["node", "server.js"]
