@@ -87,6 +87,40 @@ function isSameExt(a, b) {
   return a.trim().toLowerCase() === b.trim().toLowerCase();
 }
 
+// ✅ Helper: Ensure the output file has the correct extension before sending
+async function ensureProperExtension(filePath, targetExt) {
+  const ext = path.extname(filePath).replace('.', '').toLowerCase();
+  const correctExt = targetExt.replace('.', '').toLowerCase();
+
+  // If extension is missing or wrong, rename it
+  if (!ext || ext !== correctExt) {
+    const fixedPath = `${filePath}.${correctExt}`;
+    try {
+      await fsp.rename(filePath, fixedPath);
+      console.log(`🔧 Fixed file extension: ${fixedPath}`);
+      return fixedPath;
+    } catch (err) {
+      console.warn('⚠️ Could not rename file:', err);
+    }
+  }
+
+  return filePath;
+}
+  
+// ✅ Helper: safely delete temp files after streaming or errors
+async function safeCleanup(filePath) {
+  try {
+    if (filePath && fs.existsSync(filePath)) {
+      await fsp.unlink(filePath);
+      console.log(`🧹 Temp file deleted: ${filePath}`);
+    }
+  } catch (err) {
+    console.warn(`⚠️ Cleanup failed for ${filePath}:`, err.message);
+  }
+    }
+    
+
+
 // Conversion functions (each returns path to output file)
 async function convertImage(inputPath, outPath, targetExt, magickCmd) {
   // For PDF inputs: convert first page by default to image (use [0])
@@ -429,13 +463,25 @@ router.post("/", (req, res) => {
         }
 
         // Ensure file exists and non-zero
-        if (!producedPath || !fs.existsSync(producedPath)) throw new Error("Conversion did not produce a result file.");
-        const stats = fs.statSync(producedPath);
-        if (stats.size === 0) throw new Error("Resulting file is empty (0 bytes).");
+if (!producedPath || !fs.existsSync(producedPath)) throw new Error("Conversion did not produce a result file.");
+const stats = fs.statSync(producedPath);
+if (stats.size === 0) throw new Error("Resulting file is empty (0 bytes).");
 
-        // Send the file as response naked (no folder, direct bytes)
-        const clientFileName = safeOutputName(originalName, extOfFilename(producedPath) || targetExt);
-        streamAndFinish(producedPath, clientFileName);
+// ✅ Verify and fix missing extension before sending
+producedPath = await ensureProperExtension(producedPath, targetExt);
+
+const clientFileName = safeOutputName(originalName, extOfFilename(producedPath) || targetExt);
+
+// ✅ Stream the file and clean up safely afterward
+res.download(producedPath, clientFileName, async (err) => {
+  if (err) {
+    console.error('❌ Download error:', err);
+  }
+  await safeCleanup(producedPath);
+});
+        
+        
+        
 
       } catch (e) {
         console.error("Processing error:", e && e.message ? e.message : e);
@@ -444,6 +490,11 @@ router.post("/", (req, res) => {
         if (!res.headersSent) {
           const message = (e && e.message) ? e.message : "Processing failed";
           return res.status(500).json({ error: message });
+
+
+  console.error("❌ Conversion failed:", err);
+  await safeCleanup(producedPath);
+  res.status(500).json({ error: err.message });
         }
       }
     })();
