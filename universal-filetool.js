@@ -129,20 +129,46 @@ async function compressImage(inputPath, outPath, targetExt, magickCmd) {
 }
 
 async function convertAudio(inputPath, outPath, targetExt) {
-  // Map to common codecs; ffmpeg will choose defaults if not specified
-  // Use -y to overwrite
-  const codecArgs = {
-    mp3: `-codec:a libmp3lame -b:a 192k`,
-    wav: `-codec:a pcm_s16le`,
-    ogg: `-codec:a libvorbis -b:a 160k`,
-    aac: `-codec:a aac -b:a 160k`,
-    flac: `-codec:a flac`
-  };
-  const ca = codecArgs[targetExt] || `-codec:a libmp3lame -b:a 192k`;
-  const cmd = `ffmpeg -y -i "${inputPath}" ${ca} "${outPath}"`;
+  // Map to safe and compatible ffmpeg audio encoders
+  let codec = "libmp3lame";
+  let extra = "";
+
+  switch (targetExt) {
+    case "ogg":
+      codec = "libvorbis";
+      // ✅ Force resample, stereo, and safe bitrate — fixes encoder setup errors
+      extra = "-ar 44100 -ac 2 -b:a 128k";
+      break;
+    case "mp3":
+      codec = "libmp3lame";
+      extra = "-b:a 192k";
+      break;
+    case "aac":
+      codec = "aac";
+      extra = "-b:a 192k";
+      break;
+    case "wav":
+      codec = "pcm_s16le";
+      break;
+    case "flac":
+      codec = "flac";
+      break;
+  }
+
+  const cmd = `ffmpeg -y -i "${inputPath}" -vn -acodec ${codec} ${extra} "${outPath}"`;
   await runCmd(cmd);
+
+  // ✅ Ensure file has proper extension
+  const fileExt = path.extname(outPath);
+  if (!fileExt || fileExt.replace(".", "") !== targetExt) {
+    const fixedPath = `${outPath}.${targetExt}`;
+    await fsp.rename(outPath, fixedPath);
+    return fixedPath;
+  }
+
   return outPath;
 }
+
 
 async function compressAudio(inputPath, outPath) {
   // Re-encode with lower bitrate for smaller size
