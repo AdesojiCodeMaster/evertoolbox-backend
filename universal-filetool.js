@@ -163,22 +163,19 @@ async function compressImage(inputPath, outPath, targetExt, magickCmd) {
 }
 
 async function convertAudio(inputPath, outPath, targetExt) {
-  // Ensure targetExt is lowercase without dot
+  // Normalize extension
   targetExt = targetExt.replace('.', '').toLowerCase();
 
-  // Determine codec and settings
+  // Ensure outPath ends with correct extension BEFORE running ffmpeg
+  let correctOutPath = outPath.endsWith(`.${targetExt}`)
+    ? outPath
+    : `${outPath}.${targetExt}`;
+
+  // Pick codec & settings based on target format
   let codec = 'libmp3lame';
   let extra = '';
 
   switch (targetExt) {
-    case 'ogg':
-      codec = 'libvorbis';
-      extra = '-ar 44100 -ac 2 -b:a 128k';
-      break;
-    case 'mp3':
-      codec = 'libmp3lame';
-      extra = '-b:a 192k';
-      break;
     case 'aac':
       codec = 'aac';
       extra = '-b:a 192k';
@@ -189,25 +186,45 @@ async function convertAudio(inputPath, outPath, targetExt) {
     case 'flac':
       codec = 'flac';
       break;
+    case 'ogg':
+      codec = 'libvorbis';
+      extra = '-ar 44100 -ac 2 -b:a 128k';
+      break;
+    case 'mp3':
+      codec = 'libmp3lame';
+      extra = '-b:a 192k';
+      break;
+    default:
+      codec = 'copy';
+      break;
   }
 
-  // ✅ Ensure the output file has the proper extension
-  const correctOutPath = outPath.endsWith(`.${targetExt}`)
-    ? outPath
-    : `${outPath}.${targetExt}`;
-
-  // Run ffmpeg with overwrite and no video
+  // ✅ Build ffmpeg command
   const cmd = `ffmpeg -y -i "${inputPath}" -vn -acodec ${codec} ${extra} "${correctOutPath}"`;
   await runCmd(cmd);
 
-  // Double-check file exists and rename if necessary
-  try {
-    await fsp.access(correctOutPath);
-    return correctOutPath;
-  } catch {
+  // ✅ Verify output file really exists
+  if (!(await fileExists(correctOutPath))) {
+    // ffmpeg might have created output without extension — fix it
     const fallback = `${outPath}.${targetExt}`;
-    await fsp.rename(outPath, fallback).catch(() => {});
-    return fallback;
+    if (await fileExists(outPath)) {
+      await fsp.rename(outPath, fallback);
+      correctOutPath = fallback;
+    } else {
+      throw new Error(`FFmpeg failed to create output file for ${targetExt}`);
+    }
+  }
+
+  return correctOutPath;
+}
+
+// Helper
+async function fileExists(p) {
+  try {
+    await fsp.access(p);
+    return true;
+  } catch {
+    return false;
   }
 }
 
