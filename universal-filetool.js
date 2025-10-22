@@ -221,7 +221,7 @@ async function convertVideo(inputPath, outPath, targetExt) {
     cmd = `ffmpeg -y -i "${inputPath}" -c:v libvpx-vp9 -b:v 1M -c:a libopus "${outPath}"`;
   } else if (['mp4', 'mov', 'm4v'].includes(targetExt)) {
     // ✅ MP4/MOV/M4V use H.264 + AAC
-    cmd = `ffmpeg -y -i "${inputPath}" -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k "${outPath}"`;
+    cmd = `ffmpeg -y -i "${inputPath}" -c:v libx264 -preset ultrafast -c:v libvpx-vp9 -b:v 1M -cpu-used 4 -crf 23 -c:a aac -b:a 128k "${outPath}"`;
   } else if (['avi', 'mkv'].includes(targetExt)) {
     // ✅ Generic safe fallback for AVI/MKV
     cmd = `ffmpeg -y -i "${inputPath}" -c:v libx264 -crf 23 -c:a aac "${outPath}"`;
@@ -478,12 +478,32 @@ producedPath = await ensureProperExtension(producedPath, targetExt);
 const clientFileName = safeOutputName(originalName, extOfFilename(producedPath) || targetExt);
 
 // ✅ Stream the file and clean up safely afterward
-res.download(producedPath, clientFileName, async (err) => {
-  if (err) {
-    console.error('❌ Download error:', err);
-  }
-  await safeCleanup(producedPath);
-});
+// ✅ Stream large files safely (prevents timeouts & memory issues)
+try {
+  const stat = fs.statSync(producedPath);
+  const mimeType = mime.lookup(clientFileName) || "application/octet-stream";
+  res.writeHead(200, {
+    "Content-Type": mimeType,
+    "Content-Length": stat.size,
+    "Content-Disposition": `attachment; filename="${clientFileName}"`,
+  });
+
+  const stream = fs.createReadStream(producedPath);
+  stream.pipe(res);
+
+  stream.on("error", async (err) => {
+    console.error("❌ Stream error:", err.message);
+    res.destroy();
+    await safeCleanup(producedPath);
+  });
+
+  res.on("finish", async () => {
+    await safeCleanup(producedPath);
+  });
+} catch (err) {
+  console.error("❌ Streaming setup failed:", err);
+  res.status(500).json({ error: "Failed to stream output file." });
+}
         
         
         
