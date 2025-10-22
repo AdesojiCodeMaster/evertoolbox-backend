@@ -212,14 +212,29 @@ async function compressAudio(inputPath, outPath) {
 }
 
 async function convertVideo(inputPath, outPath, targetExt) {
-  // We'll use libx264 for mp4, vp9/vp8 for webm if desired — keep it robust
-  const common = `-c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k`;
-  const mp4Cmd = `ffmpeg -y -i "${inputPath}" ${common} "${outPath}"`;
-  // For other containers FFmpeg will remux/encode as needed; this should be fine
-  const cmd = mp4Cmd;
+  targetExt = targetExt.replace('.', '').toLowerCase();
+
+  let cmd;
+
+  if (targetExt === 'webm') {
+    // ✅ WebM must use VP9 + Opus
+    cmd = `ffmpeg -y -i "${inputPath}" -c:v libvpx-vp9 -b:v 1M -c:a libopus "${outPath}"`;
+  } else if (['mp4', 'mov', 'm4v'].includes(targetExt)) {
+    // ✅ MP4/MOV/M4V use H.264 + AAC
+    cmd = `ffmpeg -y -i "${inputPath}" -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k "${outPath}"`;
+  } else if (['avi', 'mkv'].includes(targetExt)) {
+    // ✅ Generic safe fallback for AVI/MKV
+    cmd = `ffmpeg -y -i "${inputPath}" -c:v libx264 -crf 23 -c:a aac "${outPath}"`;
+  } else {
+    // fallback: copy streams if possible
+    cmd = `ffmpeg -y -i "${inputPath}" -c copy "${outPath}"`;
+  }
+
   await runCmd(cmd);
   return outPath;
 }
+
+
 
 async function compressVideo(inputPath, outPath) {
   // Increase CRF to reduce size
