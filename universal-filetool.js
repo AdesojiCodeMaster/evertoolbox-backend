@@ -482,7 +482,9 @@ router.post("/", (req, res) => {
     const lowerInputExt = inputExt.toLowerCase();
 
     // Accept pdf both as doc and image source — so if input or target is pdf we handle accordingly
-    const isImageCategory = imageExts.has(lowerInputExt) || imageExt.has && imageExts.has(targetExt);
+    if (!imageExts) throw new Error("imageExts not defined!");
+    
+    const isImageCategory = imageExts.has(lowerInputExt) || imageExts.has(targetExt);
     const isAudioCategory = audioExts.has(lowerInputExt) || audioExts.has(targetExt);
     const isVideoCategory = videoExts.has(lowerInputExt) || videoExts.has(targetExt);
     const isDocCategory = docExts.has(lowerInputExt) || docExts.has(targetExt);
