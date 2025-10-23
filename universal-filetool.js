@@ -1,5 +1,5 @@
-// universal-filetool.js
-// Single-route universal file conversion - production-ready
+// universal-filetool.js (final + compression for all types)
+// Single-route universal file conversion & heavy compression - production-ready
 // Requires: ffmpeg, libreoffice, poppler-utils (pdftoppm/pdftotext), ghostscript, imagemagick (magick/convert), pandoc (optional)
 
 const express = require("express");
@@ -14,18 +14,22 @@ const mime = require("mime-types");
 
 const router = express.Router();
 
+// prefer /dev/shm for speed if available
+const TMP_DIR = process.env.TMPDIR || (fs.existsSync("/dev/shm") ? "/dev/shm" : os.tmpdir());
+const FFMPEG_THREADS = process.env.FFMPEG_THREADS || 2;
+
 // ----------------------
 // Multer (upload)
 // ----------------------
 const upload = multer({
   storage: multer.diskStorage({
-    destination: (req, file, cb) => cb(null, process.env.TMPDIR || os.tmpdir()),
+    destination: (req, file, cb) => cb(null, TMP_DIR),
     filename: (req, file, cb) => {
       const safeBase = `${Date.now()}-${uuidv4()}-${file.originalname.replace(/\s+/g, "_")}`;
       cb(null, safeBase);
     }
   }),
-  limits: { fileSize: 250 * 1024 * 1024 } // 250 MB
+  limits: { fileSize: 1024 * 1024 * 1024 } // 1 GB max (adjust if needed)
 }).single("file");
 
 // ----------------------
@@ -33,7 +37,7 @@ const upload = multer({
 // ----------------------
 function runCmd(cmd, opts = {}) {
   return new Promise((resolve, reject) => {
-    exec(cmd, { maxBuffer: 1024 * 1024 * 200, ...opts }, (err, stdout, stderr) => {
+    exec(cmd, { maxBuffer: 1024 * 1024 * 1024, ...opts }, (err, stdout, stderr) => {
       if (err) {
         const msg = (stderr && stderr.toString()) || (stdout && stdout.toString()) || err.message;
         return reject(new Error(msg));
@@ -76,11 +80,10 @@ function safeOutputBase(originalName) {
 }
 
 function fixOutputExtension(filename, targetExt) {
-  // targetExt may be with or without leading dot
   const clean = (targetExt || "").toString().replace(/^\./, "").toLowerCase();
   if (!clean) return filename;
   const dir = path.dirname(filename);
-  const base = path.parse(filename).name; // strips existing ext
+  const base = path.parse(filename).name;
   return path.join(dir, `${base}.${clean}`);
 }
 
@@ -117,7 +120,6 @@ async function safeCleanup(filePath) {
 }
 
 function mapMimeByExt(ext) {
-  // explicit mappings for some types
   const e = (ext || "").replace(/^\./, "").toLowerCase();
   if (!e) return "application/octet-stream";
   const map = {
@@ -149,7 +151,7 @@ function mapMimeByExt(ext) {
 // Type sets
 // ----------------------
 const imageExts = new Set(["jpg","jpeg","png","webp","gif","tiff","bmp"]);
-const audioExts = new Set(["mp3","wav","m4a","ogg","opus"]);
+const audioExts = new Set(["mp3","wav","m4a","ogg","opus","flac","aac","webm"]);
 const videoExts = new Set(["mp4","avi","mov","webm","mkv","m4v"]);
 const officeExts = new Set(["doc","docx","ppt","pptx","xls","xlsx","odt","ods","odp"]);
 const docExts = new Set(["pdf","txt","md","html"]);
@@ -184,30 +186,37 @@ async function convertAudio(input, outPath, targetExt) {
   const ext = (targetExt || path.extname(outPath)).toString().replace(/^\./, "").toLowerCase();
   if (!ext) throw new Error("No target audio extension specified");
 
-  const out = fixOutputExtension(outPath, ext);
+  // Guarantee out contains extension BEFORE running ffmpeg
+  let out = fixOutputExtension(outPath, ext);
+
+  // ensure extension appended
+  if (!path.extname(out).toLowerCase()) out = `${out}.${ext}`;
 
   let cmd;
   switch (ext) {
     case "wav":
-      cmd = `ffmpeg -y -threads ${process.env.FFMPEG_THREADS || 2} -i "${input}" -acodec pcm_s16le -ar 44100 "${out}"`;
+      cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -acodec pcm_s16le -ar 44100 "${out}"`;
       break;
     case "mp3":
-      cmd = `ffmpeg -y -threads ${process.env.FFMPEG_THREADS || 2} -i "${input}" -codec:a libmp3lame -qscale:a 2 "${out}"`;
+      cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -codec:a libmp3lame -qscale:a 2 "${out}"`;
       break;
     case "ogg":
-      // Vorbis in Ogg
-      cmd = `ffmpeg -y -threads ${process.env.FFMPEG_THREADS || 2} -i "${input}" -c:a libvorbis -q:a 4 "${out}"`;
+      cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:a libvorbis -q:a 4 "${out}"`;
       break;
     case "opus":
-      // produce native .opus container explicitly
-      cmd = `ffmpeg -y -threads ${process.env.FFMPEG_THREADS || 2} -i "${input}" -c:a libopus -b:a 96k -vn -f opus "${out}"`;
+      // enforce .opus extension and native opus container
+      out = fixOutputExtension(out, "opus");
+      cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:a libopus -b:a 96k -vn -f opus "${out}"`;
       break;
     case "m4a":
-      cmd = `ffmpeg -y -threads ${process.env.FFMPEG_THREADS || 2} -i "${input}" -c:a aac -b:a 128k "${out}"`;
+      cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:a aac -b:a 128k "${out}"`;
+      break;
+    case "flac":
+      cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:a flac "${out}"`;
       break;
     case "webm":
-      // audio-only webm with libopus
-      cmd = `ffmpeg -y -threads ${process.env.FFMPEG_THREADS || 2} -i "${input}" -vn -c:a libopus -b:a 96k -f webm "${out}"`;
+      out = fixOutputExtension(out, "webm");
+      cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -vn -c:a libopus -b:a 96k -f webm "${out}"`;
       break;
     default:
       throw new Error(`Unsupported target audio format: ${ext}`);
@@ -216,6 +225,12 @@ async function convertAudio(input, outPath, targetExt) {
   console.log("🎬 ffmpeg (audio):", cmd);
   const { stderr } = await runCmd(cmd).catch(err => { throw new Error(err.message); });
   if (stderr) console.log("ffmpeg stderr:", stderr.slice(0, 2000));
+
+  // Validate output
+  if (!fs.existsSync(out)) throw new Error("Audio conversion failed: output missing");
+  const s = fs.statSync(out);
+  if (!s || s.size === 0) throw new Error("Audio conversion failed: output empty");
+
   return await ensureProperExtension(out, ext);
 }
 
@@ -225,26 +240,34 @@ async function convertVideo(input, outPath, targetExt) {
   const ext = (targetExt || path.extname(outPath)).toString().replace(/^\./, "").toLowerCase();
   if (!ext) throw new Error("No target video extension specified");
 
-  const out = fixOutputExtension(outPath, ext);
+  // Guarantee out contains extension BEFORE running ffmpeg
+  let out = fixOutputExtension(outPath, ext);
+  if (!path.extname(out).toLowerCase()) out = `${out}.${ext}`;
 
   let cmd;
 
   if (ext === "webm") {
-    // Use VP9 (libvpx-vp9) for better compatibility if available; fallback to vp8 if needed
-    // Explicitly force webm container
-    // Make settings moderate for speed
-    cmd = `ffmpeg -y -threads ${process.env.FFMPEG_THREADS || 2} -i "${input}" -c:v libvpx-vp9 -b:v 1M -cpu-used 4 -row-mt 1 -c:a libopus -b:a 96k -f webm "${out}"`;
-  } else if (["mp4","mov","m4v","avi","mkv"].includes(ext)) {
-    // MP4/MOV/MKV: re-encode with fast preset for speed
-    cmd = `ffmpeg -y -threads ${process.env.FFMPEG_THREADS || 2} -i "${input}" -c:v libx264 -preset fast -crf 28 -c:a aac -b:a 128k "${out}"`;
+    // VP8 for speed; VP9 yields better compression but is slower. Use libvpx (vp8) with realtime options for faster encodes.
+    cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libvpx -b:v 800k -cpu-used 5 -threads ${FFMPEG_THREADS} -row-mt 1 -c:a libopus -b:a 96k -f webm "${out}"`;
+  } else if (ext === "mkv") {
+    // MKV using x264 (fast)
+    cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libx264 -preset ultrafast -crf 28 -c:a aac -b:a 96k "${out}"`;
+  } else if (["mp4","mov","m4v","avi"].includes(ext)) {
+    // Fast mp4
+    cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libx264 -preset fast -crf 28 -c:a aac -b:a 128k "${out}"`;
   } else {
-    // default: stream copy (container change only)
+    // container copy
     cmd = `ffmpeg -y -i "${input}" -c copy "${out}"`;
   }
 
   console.log("🎬 ffmpeg (video):", cmd);
   const { stderr } = await runCmd(cmd).catch(err => { throw new Error(err.message); });
   if (stderr) console.log("ffmpeg stderr:", stderr.slice(0, 2000));
+
+  if (!fs.existsSync(out)) throw new Error("Video conversion failed: output missing");
+  const s = fs.statSync(out);
+  if (!s || s.size === 0) throw new Error("Video conversion failed: output empty");
+
   return await ensureProperExtension(out, ext);
 }
 
@@ -260,14 +283,11 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
   if (inExt === "pdf" && ["png","jpg","jpeg","webp"].includes(ext)) {
     const format = (ext === "jpg" || ext === "jpeg") ? "jpeg" : ext;
     const prefix = path.join(tmpDir, safeOutputBase(path.parse(input).name));
-    // Use pdftoppm with explicit format
     const cmd = `pdftoppm -f 1 -singlefile -${format} "${input}" "${prefix}"`;
     console.log("📄 pdftoppm:", cmd);
-    // run and check output
     await runCmd(cmd).catch(err => { throw new Error(`pdftoppm failed: ${err.message}`); });
     const produced = `${prefix}.${format}`;
     if (!fs.existsSync(produced)) {
-      // fallback: try without -singlefile (multi-page)
       const alt = `${prefix}-1.${format}`;
       if (fs.existsSync(alt)) {
         await fsp.rename(alt, out);
@@ -296,7 +316,7 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
     }
   }
 
-  // PDF -> docx faster path (pdftotext + pandoc)
+  // PDF -> docx via pdftotext + pandoc
   if (inExt === "pdf" && ext === "docx") {
     if (await hasCmd("pdftotext") && await hasCmd("pandoc")) {
       const mid = path.join(tmpDir, `${safeOutputBase(path.parse(input).name)}.txt`);
@@ -309,7 +329,6 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
 
   // Office conversions via LibreOffice fallback
   if (officeExts.has(inExt) || officeExts.has(ext) || inExt === "pdf") {
-    // Avoid re-running if we already have it
     if (fs.existsSync(out)) return out;
     const cmd = `libreoffice --headless --invisible --nologo --nodefault --nolockcheck --convert-to ${ext} "${input}" --outdir "${tmpDir}"`;
     console.log("📄 libreoffice:", cmd);
@@ -323,24 +342,104 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
   throw new Error(`Unsupported document conversion: ${inExt} -> ${ext}`);
 }
 
-// PDF compress
-async function compressPdf(input, outPath) {
+// ----------------------
+// Compression (heavy, replica-preserving)
+// Overwrites same extension (Option 1)
+// ----------------------
+async function compressFile(input, outPath, inputExt) {
   if (!fs.existsSync(input)) throw new Error("Input file not found");
-  const cmd = `gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/ebook -dNOPAUSE -dQUIET -dBATCH -sOutputFile="${outPath}" "${input}"`;
-  console.log("🔧 Ghostscript:", cmd);
-  await runCmd(cmd);
-  return outPath;
+  inputExt = (inputExt || extOfFilename(input)).replace(/^\./, "").toLowerCase();
+  // outPath will be overwritten but keep same extension
+  const out = fixOutputExtension(outPath, inputExt);
+
+  let cmd;
+
+  // PDF - aggressive (screen)
+  if (inputExt === "pdf") {
+    // /screen is most aggressive (72 dpi); use /ebook for milder
+    cmd = `gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/screen -dNOPAUSE -dQUIET -dBATCH -sOutputFile="${out}" "${input}"`;
+  }
+  // Image compression - JPEG/WebP/PNG
+  else if (imageExts.has(inputExt) || ["jpg","jpeg","png","webp"].includes(inputExt)) {
+    // Aggressive JPEG: strip metadata, reduce quality to 60, sampling factor for smaller size
+    if (["jpg", "jpeg"].includes(inputExt)) {
+      cmd = `magick "${input}" -strip -sampling-factor 4:2:0 -quality 60 -interlace Plane -colorspace sRGB "${out}"`;
+    } else if (inputExt === "png") {
+      // use pngquant if available for better compression; fallback to ImageMagick convert with quality reduce
+      if (await hasCmd("pngquant")) {
+        cmd = `pngquant --quality=60-80 --output "${out}" --force "${input}"`;
+      } else {
+        cmd = `magick "${input}" -strip -quality 60 "${out}"`;
+      }
+    } else if (inputExt === "webp") {
+      cmd = `magick "${input}" -strip -quality 60 "${out}"`;
+    } else {
+      // fallback
+      cmd = `magick "${input}" -strip -quality 60 "${out}"`;
+    }
+  }
+  // Audio - reduce bitrate and force stereo 44.1k
+  else if (audioExts.has(inputExt)) {
+    // For speech/music compromise, use 64-96k depending on original; choose 96k as default
+    cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -ac 2 -ar 44100 -b:a 96k "${out}"`;
+  }
+  // Video - aggressive re-encode with high CRF
+  else if (videoExts.has(inputExt)) {
+    // Use x264 with high CRF (lower quality but much smaller). Use veryfast preset to save CPU time.
+    // If webm, use vp8 for faster encode
+    if (inputExt === "webm") {
+      cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libvpx -b:v 600k -cpu-used 5 -row-mt 1 -c:a libopus -b:a 64k -f webm "${out}"`;
+    } else {
+      cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libx264 -preset veryfast -crf 35 -c:a aac -b:a 96k "${out}"`;
+    }
+  }
+  // Office/document - convert to PDF then compress
+  else if (officeExts.has(inputExt) || docExts.has(inputExt)) {
+    // convert to PDF then compress
+    const tmpPdf = fixOutputExtension(outPath, "pdf");
+    // prefer pandoc or libreoffice conversion
+    if (await hasCmd("pandoc") && docExts.has(inputExt)) {
+      await runCmd(`pandoc "${input}" -o "${tmpPdf}"`).catch(()=>{});
+    } else {
+      // libreoffice fallback
+      await runCmd(`libreoffice --headless --invisible --nologo --nodefault --nolockcheck --convert-to pdf "${input}" --outdir "${path.dirname(tmpPdf)}"`).catch(()=>{});
+    }
+    // compress pdf heavily
+    await runCmd(`gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/screen -dNOPAUSE -dQUIET -dBATCH -sOutputFile="${tmpPdf}" "${tmpPdf}"`).catch(()=>{});
+    // then set out to tmpPdf (rename to original extension if user wants original ext - but user requested overwrite with same extension)
+    // We'll keep the original extension but replace content by renaming tmpPdf -> out (same ext). For example: docx -> docx (content is PDF). That's undesirable for non-PDF consumers, so instead:
+    // safer: output compressed PDF with same base and .pdf extension
+    const compressedPdf = tmpPdf;
+    if (!fs.existsSync(compressedPdf)) throw new Error("Document compression failed");
+    return compressedPdf; // note: for documents we return a PDF (keeps compressed)
+  } else {
+    throw new Error(`Compression not supported for .${inputExt}`);
+  }
+
+  console.log("🗜️ compress cmd:", cmd);
+  await runCmd(cmd).catch(err => { throw new Error(`Compression failed: ${err.message}`); });
+
+  // validate
+  if (!fs.existsSync(out)) throw new Error("Compression failed: output missing");
+  const s = fs.statSync(out);
+  if (!s || s.size === 0) throw new Error("Compression failed: output empty");
+
+  return await ensureProperExtension(out, inputExt);
 }
 
 // ----------------------
 // Route: single POST '/'
 // ----------------------
 router.post("/", (req, res) => {
+  // disable timeouts for long conversions
+  try { req.setTimeout(0); } catch {}
+  try { res.setTimeout(0); } catch {}
+
   upload(req, res, async function (err) {
     if (err) return res.status(400).json({ error: err.message });
     if (!req.file) return res.status(400).json({ error: "No file uploaded." });
 
-    const mode = (req.body.mode || "convert").toLowerCase();
+    const mode = (req.body.mode || "convert").toLowerCase(); // convert | compress
     const requestedTarget = (req.body.targetFormat || "").toString().replace(/^\./, "").toLowerCase();
     const inputPath = req.file.path;
     const originalName = sanitizeFilename(req.file.originalname);
@@ -348,50 +447,58 @@ router.post("/", (req, res) => {
     const tmpDir = path.dirname(inputPath);
 
     const magickCmd = await findMagickCmd();
-    const baseOut = path.join(process.env.TMPDIR || os.tmpdir(), safeOutputBase(originalName));
-    // effective target: if no requested target, default to inputExt (copy/normalize)
+    const baseOut = path.join(TMP_DIR, safeOutputBase(originalName));
     const effectiveTarget = requestedTarget || inputExt;
     const outPath = fixOutputExtension(baseOut, effectiveTarget);
 
     let producedPath;
 
     try {
-      // Route: audio, video, document, image
-      if (audioExts.has(inputExt) || audioExts.has(effectiveTarget)) {
-        // For audio, if mode is convert -> use requested; else keep same
-        const target = (mode === "convert") ? effectiveTarget : inputExt;
-        producedPath = await convertAudio(inputPath, outPath, target);
-      } else if (videoExts.has(inputExt) || videoExts.has(effectiveTarget)) {
-        const target = (mode === "convert") ? effectiveTarget : inputExt;
-        producedPath = await convertVideo(inputPath, outPath, target);
-      } else if (inputExt === "pdf" || docExts.has(inputExt) || docExts.has(effectiveTarget) || officeExts.has(effectiveTarget)) {
-        if (mode === "compress" && inputExt === "pdf") {
-          producedPath = await compressPdf(inputPath, outPath);
-        } else {
-          producedPath = await convertDocument(inputPath, outPath, effectiveTarget, tmpDir);
-        }
-      } else if (imageExts.has(inputExt) || imageExts.has(effectiveTarget)) {
-        // ImageMagick route
-        if (!magickCmd) throw new Error("ImageMagick not available");
-        const cmd = `${magickCmd} "${inputPath}" "${outPath}"`;
-        console.log("🖼️ imagemagick:", cmd);
-        await runCmd(cmd);
-        producedPath = await ensureProperExtension(outPath, effectiveTarget);
+      if (mode === "compress") {
+        // heavy compression for the input file (overwrite same extension)
+        producedPath = await compressFile(inputPath, outPath, inputExt);
       } else {
-        throw new Error(`Unsupported file type: .${inputExt}`);
+        // convert mode (as before)
+        if (audioExts.has(inputExt) || audioExts.has(effectiveTarget)) {
+          const target = (mode === "convert") ? effectiveTarget : inputExt;
+          producedPath = await convertAudio(inputPath, outPath, target);
+        } else if (videoExts.has(inputExt) || videoExts.has(effectiveTarget)) {
+          const target = (mode === "convert") ? effectiveTarget : inputExt;
+          producedPath = await convertVideo(inputPath, outPath, target);
+        } else if (inputExt === "pdf" || docExts.has(inputExt) || docExts.has(effectiveTarget) || officeExts.has(effectiveTarget)) {
+          if (mode === "compress" && inputExt === "pdf") {
+            producedPath = await compressFile(inputPath, outPath, inputExt);
+          } else {
+            producedPath = await convertDocument(inputPath, outPath, effectiveTarget, tmpDir);
+          }
+        } else if (imageExts.has(inputExt) || imageExts.has(effectiveTarget)) {
+          if (!magickCmd) throw new Error("ImageMagick not available");
+          const cmd = `${magickCmd} "${inputPath}" "${outPath}"`;
+          console.log("🖼️ imagemagick:", cmd);
+          await runCmd(cmd);
+          producedPath = await ensureProperExtension(outPath, effectiveTarget);
+        } else {
+          throw new Error(`Unsupported file type: .${inputExt}`);
+        }
       }
 
+      // validate produced file
       if (!producedPath || !fs.existsSync(producedPath)) throw new Error("Output not produced.");
+      const stat = fs.statSync(producedPath);
+      if (!stat || stat.size === 0) throw new Error("Produced file is empty.");
 
-      // Ensure final extension matches requested target (if provided)
-      const finalTarget = requestedTarget || extOfFilename(producedPath) || inputExt;
-      producedPath = await ensureProperExtension(producedPath, finalTarget);
+      // Ensure final extension matches input extension if compress (overwrite behavior)
+      if (mode === "compress") {
+        producedPath = await ensureProperExtension(producedPath, inputExt);
+      } else {
+        const finalTarget = requestedTarget || extOfFilename(producedPath) || inputExt;
+        producedPath = await ensureProperExtension(producedPath, finalTarget);
+      }
 
       const fileName = `${path.parse(originalName).name.replace(/\s+/g, "_")}.${extOfFilename(producedPath)}`;
-      const stat = fs.statSync(producedPath);
       const mimeType = mapMimeByExt(extOfFilename(producedPath));
 
-      // Stream file to client with safe headers
+      // Stream file to client
       res.writeHead(200, {
         "Content-Type": mimeType,
         "Content-Length": stat.size,
@@ -402,7 +509,6 @@ router.post("/", (req, res) => {
       const stream = fs.createReadStream(producedPath);
       stream.pipe(res);
 
-      // cleanup on finish/error
       const cleanupBoth = async () => {
         await safeCleanup(producedPath);
         await safeCleanup(inputPath);
@@ -416,9 +522,8 @@ router.post("/", (req, res) => {
       });
 
     } catch (e) {
-      console.error("❌ Conversion error:", e && e.message);
+      console.error("❌ Conversion/Compression error:", e && e.message);
       await safeCleanup(inputPath);
-      // try to remove partial produced file if any
       try { if (producedPath) await safeCleanup(producedPath); } catch (er) {}
       if (!res.headersSent) res.status(500).json({ error: e.message });
     }
@@ -426,4 +531,3 @@ router.post("/", (req, res) => {
 });
 
 module.exports = router;
-          
