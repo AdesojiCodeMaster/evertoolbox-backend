@@ -122,28 +122,28 @@ async function safeCleanup(filePath) {
 
 
 // Conversion functions (each returns path to output file)
-async function convertImage(inputPath, outPath, targetExt, magickCmd) {
-  // For PDF inputs: convert first page by default to image (use [0])
-  const inExt = extOfFilename(inputPath);
-  const isPdfSource = inExt === "pdf";
-  const density = 150; // resolution for PDF->image
-  const quality = 90;
+async function convertPdfToImage(inputPath, outPath, targetExt) {
+  // Convert PDF first page to image with white background, fast and policy-safe
+  targetExt = targetExt.replace('.', '').toLowerCase();
+  const outputBase = outPath.replace(/\.[^.]+$/, '');
+  const correctOutPath = `${outputBase}.${targetExt}`;
 
-  const src = isPdfSource ? `${inputPath}[0]` : inputPath;
-
-  // Decide if target format needs white background (JPG, JPEG, BMP, WEBP, GIF)
-  const needsWhiteBg = ["jpg", "jpeg", "bmp", "webp", "gif"].includes(targetExt.toLowerCase());
-  const bgOption = needsWhiteBg
-    ? "-background white -alpha remove -alpha off -flatten"
-    : "";
-
-  // Build full ImageMagick command
-  // Example: magick input.pdf[0] -background white -alpha remove -alpha off -flatten -strip -quality 90 output.jpg
-  const cmd = `${magickCmd} "${src}" ${bgOption} -strip -quality ${quality} "${outPath}"`;
+  let cmd;
+  if (['png', 'jpg', 'jpeg'].includes(targetExt)) {
+    // Use pdftoppm (comes with poppler-utils; safer than ImageMagick)
+    const format = targetExt === 'png' ? 'png' : 'jpeg';
+    cmd = `pdftoppm -f 1 -singlefile -png "${inputPath}" "${outputBase}"`;
+    if (format === 'jpeg') cmd = `pdftoppm -f 1 -singlefile -jpeg "${inputPath}" "${outputBase}"`;
+  } else {
+    // Fallback to convert if user explicitly asks other formats (webp, bmp, etc.)
+    cmd = `convert -density 150 "${inputPath}[0]" -background white -alpha remove -alpha off -flatten -quality 90 "${correctOutPath}"`;
+  }
 
   await runCmd(cmd);
-  return outPath;
+  return correctOutPath;
 }
+
+
 
 
 async function convertImageToPdf(inputPath, outPath, magickCmd) {
@@ -162,44 +162,35 @@ async function compressImage(inputPath, outPath, targetExt, magickCmd) {
   return outPath;
 }
 
+
 async function convertAudio(inputPath, outPath, targetExt) {
   targetExt = targetExt.replace('.', '').toLowerCase();
+  const correctOutPath = outPath.endsWith(`.${targetExt}`) ? outPath : `${outPath}.${targetExt}`;
 
-  // Ensure correct extension
-  const correctOutPath = outPath.endsWith(`.${targetExt}`)
-    ? outPath
-    : `${outPath}.${targetExt}`;
-
-  let codec = 'libmp3lame';
-  let extra = '';
-
+  let cmd;
   switch (targetExt) {
-    case 'm4a':
-      codec = 'aac'; // safe AAC codec inside .m4a container
-      extra = '-b:a 192k';
+    case 'mp3':
+      cmd = `ffmpeg -y -i "${inputPath}" -codec:a libmp3lame -qscale:a 2 "${correctOutPath}"`;
       break;
     case 'wav':
-      codec = 'pcm_s16le';
+      cmd = `ffmpeg -y -i "${inputPath}" -acodec pcm_s16le -ar 44100 "${correctOutPath}"`;
       break;
     case 'ogg':
-      codec = 'libvorbis';
-      extra = '-ar 44100 -ac 2 -b:a 128k';
+      cmd = `ffmpeg -y -i "${inputPath}" -c:a libvorbis -q:a 4 "${correctOutPath}"`;
       break;
     case 'opus':
-      codec = 'libopus';
-      extra = '-b:a 128k';
+      cmd = `ffmpeg -y -i "${inputPath}" -c:a libopus -b:a 96k "${correctOutPath}"`;
       break;
-    case 'mp3':
+    case 'm4a':
+      cmd = `ffmpeg -y -i "${inputPath}" -c:a aac -b:a 128k "${correctOutPath}"`;
+      break;
     default:
-      codec = 'libmp3lame';
-      extra = '-b:a 192k';
-      break;
+      throw new Error(`Unsupported target audio format: ${targetExt}`);
   }
 
-  const cmd = `ffmpeg -y -i "${inputPath}" -vn -acodec ${codec} ${extra} "${correctOutPath}"`;
   await runCmd(cmd);
   return correctOutPath;
-}
+    }
 
 
 
