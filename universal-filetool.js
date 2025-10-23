@@ -102,7 +102,7 @@ function fixOutputExtension(filename, targetFormat) {
   const format = (targetFormat || "").toLowerCase();
 
   // --- AUDIO ---
-  const audioExt = ["wav", "mp3", "opus", "ogg", "m4a"];
+  const audioExt = ["wav", "mp3", "opus", "ogg", "m4a", "webm"];
   if (audioExt.includes(format)) return `${clean}.${format}`;
 
   // --- VIDEO ---
@@ -124,7 +124,7 @@ function fixOutputExtension(filename, targetFormat) {
 // ✅ Helper: Ensure the output file has the correct extension before sending
 async function ensureProperExtension(filePath, targetExt) {
   const ext = path.extname(filePath).replace('.', '').toLowerCase();
-  const correctExt = targetExt.replace('.', '').toLowerCase();
+  const correctExt = (targetExt || "").replace('.', '').toLowerCase();
 
   // If extension is missing or wrong, rename it
   if (!ext || ext !== correctExt) {
@@ -155,7 +155,7 @@ async function safeCleanup(filePath) {
 
 // Mapping & helpers
 const imageExts = new Set(["jpg", "jpeg", "png", "webp", "gif", "tiff", "bmp", "pdf"]);
-const audioExts = new Set(['mp3', 'wav', 'm4a', 'ogg', 'opus']);
+const audioExts = new Set(['mp3', 'wav', 'm4a', 'ogg', 'opus', 'webm']);
 const videoExts = new Set(["mp4", "avi", "mov", "webm", "mkv"]);
 const docExts = new Set(["pdf", "docx", "txt", "md", "html"]);
 
@@ -216,7 +216,8 @@ async function convertImage(inputPath, outPath, targetExt, magickCmd) {
   }
 
   await runCmd(cmd);
-  return correctOutPath;
+  // Ensure extension if ImageMagick wrote a different name
+  return await ensureProperExtension(correctOutPath, targetExt);
 }
 
 async function compressImage(inputPath, outPath, targetExt, magickCmd) {
@@ -230,7 +231,8 @@ async function compressImage(inputPath, outPath, targetExt, magickCmd) {
 
 async function convertAudio(inputPath, outPath, targetExt) {
   targetExt = targetExt.replace('.', '').toLowerCase();
-  let correctOutPath = outPath.endsWith(`.${targetExt}`) ? outPath : `${outPath}.${targetExt}`;
+  // Ensure the desired extension is present in the path
+  let correctOutPath = fixOutputExtension(outPath, targetExt);
 
   let cmd;
   switch (targetExt) {
@@ -238,40 +240,49 @@ async function convertAudio(inputPath, outPath, targetExt) {
       cmd = `ffmpeg -y -i "${inputPath}" -codec:a libmp3lame -qscale:a 2 "${correctOutPath}"`;
       break;
     case 'wav':
+      // produce a .wav (PCM 16-bit)
       cmd = `ffmpeg -y -i "${inputPath}" -acodec pcm_s16le -ar 44100 "${correctOutPath}"`;
       break;
     case 'ogg':
       cmd = `ffmpeg -y -i "${inputPath}" -c:a libvorbis -q:a 4 "${correctOutPath}"`;
       break;
     case 'opus':
-      // Request a proper .opus container and codec
-      // Force format to opus which produces a raw/opus container; many players accept it.
-      // Also allow an ogg container if needed, but we keep the filename .opus
-      // Using -f opus reduces chances ffmpeg will pick an ogg container and name mismatch
+      // Force a native Opus container and ensure filename uses .opus
+      // -f opus encourages ffmpeg to produce an opus file instead of choosing ogg
       cmd = `ffmpeg -y -i "${inputPath}" -c:a libopus -b:a 96k -f opus "${correctOutPath}"`;
       break;
     case 'm4a':
       cmd = `ffmpeg -y -i "${inputPath}" -c:a aac -b:a 128k "${correctOutPath}"`;
+      break;
+    case 'webm':
+      // Audio-only webm using Opus — faster than full video webm transcode
+      // -vn disables video; this is handy when converting audio files into webm audio
+      cmd = `ffmpeg -y -i "${inputPath}" -vn -c:a libopus -b:a 96k "${correctOutPath}"`;
       break;
     default:
       throw new Error(`Unsupported target audio format: ${targetExt}`);
   }
 
   await runCmd(cmd);
-  // Ensure the file has the right extension even if ffmpeg chose otherwise
+
+  // If ffmpeg wrote a file with a different extension/container, try to find and rename it
   if (!fs.existsSync(correctOutPath)) {
-    // Try to find any file with same base and common audio extensions
     const base = correctOutPath.replace(/\.[^/.]+$/, "");
     const candidates = fs.readdirSync(path.dirname(correctOutPath)).map(f => path.join(path.dirname(correctOutPath), f));
     for (const c of candidates) {
       if (c.startsWith(base) && audioExts.has(extOfFilename(c))) {
-        // rename to correctOutPath
-        try { await fsp.rename(c, correctOutPath); } catch {}
+        try {
+          await fsp.rename(c, correctOutPath);
+        } catch (err) {
+          // ignore rename errors
+        }
         break;
       }
     }
   }
-  return correctOutPath;
+
+  // Final ensure
+  return await ensureProperExtension(correctOutPath, targetExt);
 }
 
 async function compressAudio(inputPath, outPath) {
@@ -285,20 +296,25 @@ async function compressAudio(inputPath, outPath) {
 
 async function convertVideo(inputPath, outPath, targetExt) {
   targetExt = targetExt.replace('.', '').toLowerCase();
-  const correctOutPath = outPath.endsWith(`.${targetExt}`) ? outPath : `${outPath}.${targetExt}`;
+  const correctOutPath = fixOutputExtension(outPath, targetExt);
 
   let cmd;
   if (targetExt === 'webm') {
-    // Use VP8 for better speed on CPU-only hosts; use row-mt and cpu-used for speed.
+    // Use VP8 (libvpx) for speed on CPU-only hosts with realtime settings
+    // cpu-used 8 trades compression for speed; row-mt 1 enables multithreading
     cmd = `ffmpeg -y -threads 0 -i "${inputPath}" -c:v libvpx -b:v 1M -cpu-used 8 -deadline realtime -row-mt 1 -c:a libopus -b:a 96k "${correctOutPath}"`;
   } else if (['mp4', 'mov', 'm4v', 'avi', 'mkv'].includes(targetExt)) {
+    // H.264 for broad compatibility; ultrafast preset for speed
     cmd = `ffmpeg -y -threads 0 -i "${inputPath}" -c:v libx264 -preset ultrafast -crf 28 -c:a aac -b:a 128k "${correctOutPath}"`;
   } else {
+    // fallback: copy streams where possible (very fast)
     cmd = `ffmpeg -y -threads 0 -i "${inputPath}" -c copy "${correctOutPath}"`;
   }
 
   await runCmd(cmd);
-  return correctOutPath;
+
+  // ensure proper extension if ffmpeg produced a different file name
+  return await ensureProperExtension(correctOutPath, targetExt);
 }
 
 async function compressVideo(inputPath, outPath) {
@@ -314,7 +330,7 @@ async function convertDocument(inputPath, outPath, targetExt, tempDir) {
 
   // DOCX/HTML/TXT -> PDF via LibreOffice
   if (targetExt === "pdf" && (inExt !== "pdf")) {
-    const cmd = `libreoffice --headless --convert-to pdf "${inputPath}" --outdir "${tempDir}"`;
+    const cmd = `libreoffice --headless --invisible --nologo --nodefault --nolockcheck --convert-to pdf "${inputPath}" --outdir "${tempDir}"`;
     await runCmd(cmd);
     const generated = path.join(tempDir, `${path.parse(inputPath).name}.pdf`);
     if (!fs.existsSync(generated)) throw new Error("LibreOffice did not produce PDF");
@@ -322,11 +338,11 @@ async function convertDocument(inputPath, outPath, targetExt, tempDir) {
     return outPath;
   }
 
-  // PDF -> DOCX or HTML via LibreOffice (preferred)
+  // PDF -> DOCX or HTML via LibreOffice (preferred), optimized flags for speed
   if (inExt === "pdf" && (targetExt === "docx" || targetExt === "html")) {
     const format = targetExt === "docx" ? "docx" : "html";
     try {
-      const cmd = `libreoffice --headless --convert-to ${format} "${inputPath}" --outdir "${tempDir}"`;
+      const cmd = `libreoffice --headless --invisible --nologo --nodefault --nolockcheck --convert-to ${format} "${inputPath}" --outdir "${tempDir}"`;
       await runCmd(cmd);
       const gen = path.join(tempDir, `${path.parse(inputPath).name}.${format}`);
       if (fs.existsSync(gen)) {
@@ -346,7 +362,6 @@ async function convertDocument(inputPath, outPath, targetExt, tempDir) {
       if (targetExt === 'docx') {
         await runCmd(`pandoc "${txtTemp}" -o "${outPath}"`);
         if (!fs.existsSync(outPath)) throw new Error("pandoc fallback to docx failed");
-        // remove intermediate
         try { await fsp.unlink(txtTemp); } catch {}
         return outPath;
       } else if (targetExt === 'html') {
@@ -369,22 +384,18 @@ async function convertDocument(inputPath, outPath, targetExt, tempDir) {
     await runCmd(`pdftotext "${inputPath}" "${txtTemp}"`);
     if (!fs.existsSync(txtTemp)) throw new Error("pdftotext failed");
     if (targetExt === "txt") {
-      // Move to outPath
       await fsp.rename(txtTemp, outPath);
       return outPath;
     } else {
-      // md: use pandoc if available, else return plain txt but with .md extension
       if (await hasCmd('pandoc')) {
         await runCmd(`pandoc "${txtTemp}" -o "${outPath}"`);
         if (!fs.existsSync(outPath)) {
-          // fallback: move txt to outPath
           await fsp.rename(txtTemp, outPath);
         } else {
           try { await fsp.unlink(txtTemp); } catch {}
         }
         return outPath;
       } else {
-        // no pandoc - just rename txt to md
         await fsp.rename(txtTemp, outPath);
         return outPath;
       }
@@ -393,16 +404,14 @@ async function convertDocument(inputPath, outPath, targetExt, tempDir) {
 
   // TXT/MD/HTML -> PDF via LibreOffice / pandoc fallback
   if ((inExt === "txt" || inExt === "md" || inExt === "html") && targetExt === "pdf") {
-    // prefer libreoffice
     try {
-      const cmd = `libreoffice --headless --convert-to pdf "${inputPath}" --outdir "${tempDir}"`;
+      const cmd = `libreoffice --headless --invisible --nologo --nodefault --nolockcheck --convert-to pdf "${inputPath}" --outdir "${tempDir}"`;
       await runCmd(cmd);
       const generated = path.join(tempDir, `${path.parse(inputPath).name}.pdf`);
       if (!fs.existsSync(generated)) throw new Error("LibreOffice conversion failed");
       await fsp.rename(generated, outPath);
       return outPath;
     } catch (e) {
-      // fallback to pandoc if available
       if (await hasCmd('pandoc')) {
         await runCmd(`pandoc "${inputPath}" -o "${outPath}"`);
         if (!fs.existsSync(outPath)) throw new Error("pandoc conversion failed");
@@ -473,7 +482,7 @@ router.post("/", (req, res) => {
     const lowerInputExt = inputExt.toLowerCase();
 
     // Accept pdf both as doc and image source — so if input or target is pdf we handle accordingly
-    const isImageCategory = imageExts.has(lowerInputExt) || imageExts.has(targetExt);
+    const isImageCategory = imageExts.has(lowerInputExt) || imageExt.has && imageExts.has(targetExt);
     const isAudioCategory = audioExts.has(lowerInputExt) || audioExts.has(targetExt);
     const isVideoCategory = videoExts.has(lowerInputExt) || videoExts.has(targetExt);
     const isDocCategory = docExts.has(lowerInputExt) || docExts.has(targetExt);
@@ -610,4 +619,3 @@ router.post("/", (req, res) => {
 });
 
 module.exports = router;
-    
