@@ -211,27 +211,32 @@ async function compressAudio(inputPath, outPath) {
   return outPath;
 }
 
+
 async function convertVideo(inputPath, outPath, targetExt) {
+  // fast, pragmatic conversion settings for Render-like servers
   targetExt = targetExt.replace('.', '').toLowerCase();
+
+  // ensure outPath has extension (your ensureProperExtension handles before streaming,
+  // but keep consistent naming here)
+  const correctOutPath = outPath.endsWith(`.${targetExt}`) ? outPath : `${outPath}.${targetExt}`;
 
   let cmd;
 
   if (targetExt === 'webm') {
-    // ✅ WebM must use VP9 + Opus
-    cmd = `ffmpeg -y -i "${inputPath}" -c:v libvpx-vp9 -b:v 1M -c:a libopus "${outPath}"`;
-  } else if (['mp4', 'mov', 'm4v'].includes(targetExt)) {
-    // ✅ MP4/MOV/M4V use H.264 + AAC
-    cmd = `ffmpeg -y -i "${inputPath}" -c:v libx264 -preset ultrafast -c:v libvpx-vp9 -b:v 1M -cpu-used 4 -crf 23 -c:a aac -b:a 128k "${outPath}"`;
-  } else if (['avi', 'mkv'].includes(targetExt)) {
-    // ✅ Generic safe fallback for AVI/MKV
-    cmd = `ffmpeg -y -i "${inputPath}" -c:v libx264 -crf 23 -c:a aac "${outPath}"`;
+    // Use VP8 (libvpx) for speed (far faster than VP9) + libopus audio
+    // -deadline realtime and -cpu-used 8 favor speed over compression
+    cmd = `ffmpeg -y -threads 0 -i "${inputPath}" -c:v libvpx -b:v 1M -cpu-used 8 -deadline realtime -c:a libopus -b:a 96k "${correctOutPath}"`;
+  } else if (['mp4', 'mov', 'm4v', 'avi', 'mkv'].includes(targetExt)) {
+    // Use H.264 (libx264) for broad compatibility. ultrafast preset for speed.
+    // For containers that dislike AAC we still use aac (widely supported).
+    cmd = `ffmpeg -y -threads 0 -i "${inputPath}" -c:v libx264 -preset ultrafast -crf 28 -c:a aac -b:a 128k "${correctOutPath}"`;
   } else {
-    // fallback: copy streams if possible
-    cmd = `ffmpeg -y -i "${inputPath}" -c copy "${outPath}"`;
+    // fallback: copy streams where possible (very fast)
+    cmd = `ffmpeg -y -threads 0 -i "${inputPath}" -c copy "${correctOutPath}"`;
   }
 
   await runCmd(cmd);
-  return outPath;
+  return correctOutPath;
 }
 
 
@@ -367,35 +372,7 @@ router.post("/", (req, res) => {
       }
     }
 
-    // Stream file to response and cleanup afterward
-    function streamAndFinish(filePath, filenameForClient) {
-      try {
-        const stat = fs.statSync(filePath);
-        const mimeType = mime.lookup(filenameForClient) || "application/octet-stream";
-        res.setHeader("Content-Type", mimeType);
-        res.setHeader("Content-Length", stat.size);
-        res.setHeader("Content-Disposition", `attachment; filename="${filenameForClient}"`);
-        const read = fs.createReadStream(filePath);
-        read.pipe(res);
-
-        // After response finishes, cleanup
-        res.on("finish", async () => {
-          try {
-            await cleanupAll();
-          } catch (e) {
-            console.error("Cleanup error:", e);
-          }
-        });
-
-        res.on("close", async () => {
-          try { await cleanupAll(); } catch (e) { /* ignore */ }
-        });
-      } catch (e) {
-        console.error("Streaming error:", e);
-        cleanupAll();
-        if (!res.headersSent) res.status(500).json({ error: "Failed to stream result." });
-      }
-    }
+    
 
     // Run conversion/compression with try/catch
     (async () => {
@@ -513,15 +490,12 @@ try {
         // Cleanup input file now
         try { await cleanupAll(); } catch (_) {}
         if (!res.headersSent) {
-          const message = (e && e.message) ? e.message : "Processing failed";
-          return res.status(500).json({ error: message });
-
-
-  console.error("❌ Conversion failed:", err);
+  const message = (e && e.message) ? e.message : "Processing failed";
+  console.error("❌ Conversion failed:", message);
   await safeCleanup(producedPath);
-  res.status(500).json({ error: err.message });
+  return res.status(500).json({ error: message });
         }
-      }
+        }
     })();
   });
 });
