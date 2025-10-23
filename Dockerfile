@@ -1,46 +1,75 @@
 # ------------------------------------------------------------
-# 🧰 EverToolbox Backend Dockerfile (Render-ready, Full Support)
-# Supports PDF↔Image, Audio, Video, Office docs, etc.
+# ⚡ EverToolbox Backend Dockerfile (Render-Optimized)
+# Faster conversions: tuned for ffmpeg, LibreOffice, ImageMagick
 # ------------------------------------------------------------
 
 FROM node:20-bullseye
 
-# Create app directory
+# Set workdir
 WORKDIR /app
 
-# Install all required system dependencies
-# Includes: ffmpeg, ImageMagick, Ghostscript, LibreOffice, Pandoc, Poppler
+# ------------------------------------------------------------
+# 🧩 Install system dependencies
+# ------------------------------------------------------------
 RUN apt-get update && \
-    apt-get install -y \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
       ffmpeg \
       imagemagick \
       ghostscript \
       libreoffice \
       pandoc \
-      poppler-utils && \
+      poppler-utils \
+      fonts-dejavu-core \
+      && \
     \
     # ✅ Fix ImageMagick security policy for PDF conversion
     sed -i 's/<policy domain="coder" rights="none" pattern="PDF" \/>/<policy domain="coder" rights="read|write" pattern="PDF" \/>/' /etc/ImageMagick-6/policy.xml || true && \
     sed -i 's/<policy domain="coder" rights="none" pattern="PDF" \/>/<policy domain="coder" rights="read|write" pattern="PDF" \/>/' /etc/ImageMagick-7/policy.xml || true && \
     \
-    # ✅ Clean up to keep image small
+    # ✅ Clean cache
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Copy dependency manifests
-COPY package*.json ./
+# ------------------------------------------------------------
+# ⚙️ Performance environment variables
+# ------------------------------------------------------------
+# Use in-memory tmpfs for faster I/O (Render compatible)
+ENV TMPDIR=/dev/shm
 
-# Install Node.js dependencies
+# Force ffmpeg to use multiple threads
+ENV FFMPEG_THREADS=2
+
+# Optional: reduce LibreOffice cold start lag
+RUN mkdir -p /root/.config/libreoffice/4/user
+
+# ------------------------------------------------------------
+# 🪄 Prewarm key tools (optional but speeds first request)
+# ------------------------------------------------------------
+RUN ffmpeg -version && \
+    libreoffice --headless --version && \
+    convert -version && \
+    gs --version && \
+    pandoc -v && \
+    echo "✅ Prewarm complete."
+
+# ------------------------------------------------------------
+# 📦 Install Node dependencies
+# ------------------------------------------------------------
+COPY package*.json ./
 RUN npm install --production
 
-# Copy the backend source code
+# ------------------------------------------------------------
+# 🧠 Copy app source
+# ------------------------------------------------------------
 COPY . .
 
-# Expose port for Render
+# ------------------------------------------------------------
+# 🌐 Expose port and environment
+# ------------------------------------------------------------
 EXPOSE 10000
-
-# Environment variables
 ENV PORT=10000
 ENV NODE_ENV=production
 
-# Start the backend
+# ------------------------------------------------------------
+# 🚀 Start backend
+# ------------------------------------------------------------
 CMD ["node", "server.js"]
