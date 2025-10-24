@@ -9,7 +9,7 @@ const fs = require("fs");
 const fsp = fs.promises;
 const path = require("path");
 const os = require("os");
-const { exec } = require("child_process");
+const { exec, execSync } = require("child_process");
 const { pipeline } = require("stream");
 const { promisify } = require("util");
 const mime = require("mime-types");
@@ -17,7 +17,53 @@ const mime = require("mime-types");
 const pipe = promisify(pipeline);
 const router = express.Router();
 
-const TMP_DIR = process.env.TMPDIR || (fs.existsSync("/dev/shm") ? "/dev/shm" : os.tmpdir());
+// ---------------- Smart TMP selection ----------------
+// prefer /dev/shm for speed but ensure there's enough free space; otherwise fallback to os.tmpdir()
+function parseDfOutput(out) {
+  // expects `df -Pk <path>` output; returns available KB as integer
+  try {
+    const lines = out.trim().split("\n").filter(Boolean);
+    if (lines.length < 2) return 0;
+    const cols = lines[lines.length - 1].trim().split(/\s+/);
+    // typical: Filesystem 1024-blocks Used Available Use% Mounted_on
+    // using "Available" column (index 3)
+    const availableKb = parseInt(cols[3], 10);
+    return isNaN(availableKb) ? 0 : availableKb;
+  } catch (e) {
+    return 0;
+  }
+}
+
+function getFreeKbSync(checkPath) {
+  try {
+    const out = execSync(`df -Pk "${checkPath}"`, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    return parseDfOutput(out);
+  } catch (e) {
+    return 0;
+  }
+}
+
+// threshold in KB (e.g., 200 MB)
+const TMP_MIN_KB = Number(process.env.TMP_MIN_KB || 200 * 1024);
+
+function chooseTmpDir() {
+  const candidate = process.env.TMPDIR || (fs.existsSync("/dev/shm") ? "/dev/shm" : null);
+  if (candidate) {
+    const free = getFreeKbSync(candidate);
+    if (free >= TMP_MIN_KB) {
+      console.log(`🧭 Using temp dir: ${candidate} (free ${(free / 1024).toFixed(1)} MB)`);
+      return candidate;
+    } else {
+      console.warn(`⚠️ Insufficient space on ${candidate}: ${(free / 1024).toFixed(1)} MB, falling back to os.tmpdir()`);
+    }
+  }
+  const fallback = os.tmpdir();
+  const fallbackFree = getFreeKbSync(fallback);
+  console.log(`🧭 Using fallback temp dir: ${fallback} (free ${(fallbackFree / 1024).toFixed(1)} MB)`);
+  return fallback;
+}
+
+const TMP_DIR = chooseTmpDir();
 const FFMPEG_THREADS = String(process.env.FFMPEG_THREADS || "2");
 const STABLE_CHECK_MS = 200;
 const STABLE_CHECK_ROUNDS = 3;
@@ -35,9 +81,11 @@ const upload = multer({
 // ---------------- Exec wrapper ----------------
 function runCmd(cmd, opts = {}) {
   return new Promise((resolve, reject) => {
+    // make error messages more helpful
     exec(cmd, { maxBuffer: 1024 * 1024 * 1024, ...opts }, (err, stdout, stderr) => {
       if (err) {
-        const msg = (stderr && stderr.toString()) || (stdout && stdout.toString()) || err.message;
+        const outErr = (stderr && stderr.toString()) || (stdout && stdout.toString()) || err.message;
+        const msg = `Command failed: ${cmd}\n${outErr}`;
         return reject(new Error(msg));
       }
       resolve({ stdout: stdout ? stdout.toString() : "", stderr: stderr ? stderr.toString() : "" });
@@ -151,14 +199,28 @@ const docExts = new Set(["pdf","txt","md","html"]);
   } catch (e) { console.warn("Prewarm notice:", e && e.message); }
 })();
 
+// ---------------- Helper: resource-guard for tmp space (KB) ----------------
+function ensureTmpSpaceSync(requiredKb, checkPath = TMP_DIR) {
+  const freeKb = getFreeKbSync(checkPath);
+  if (freeKb <= 0) {
+    throw new Error(`Could not determine free disk space on ${checkPath}`);
+  }
+  if (freeKb < requiredKb) {
+    throw new Error(`Insufficient temp space on ${checkPath}: required ${(requiredKb/1024).toFixed(1)} MB, available ${(freeKb/1024).toFixed(1)} MB`);
+  }
+  return true;
+}
+
 // ---------------- Helper: flatten image to white ----------------
 async function flattenImageWhite(input, out) {
   // support either 'magick' or 'convert'
   const magickCmd = await findMagickCmd();
   if (magickCmd) {
-    // 🩵 FIX: stronger flatten flags to avoid dark backgrounds
-    // also add +repage to avoid canvas problems
-    const cmd = `${magickCmd} "${input}" -background white -alpha remove -flatten +repage -colorspace sRGB "${out}"`;
+    // safer ImageMagick limits to prevent OOM or "No space left" errors
+    const memLimit = process.env.IMAGEMAGICK_LIMIT_MEMORY || "256MB";
+    const mapLimit = process.env.IMAGEMAGICK_LIMIT_MAP || "512MB";
+    // add +repage to avoid canvas problems
+    const cmd = `${magickCmd} -limit memory ${memLimit} -limit map ${mapLimit} "${input}" -background white -alpha remove -flatten +repage -colorspace sRGB "${out}"`;
     await runCmd(cmd);
   } else {
     await fsp.copyFile(input, out);
@@ -169,9 +231,14 @@ async function flattenImageWhite(input, out) {
 async function renderPdfWithGs(inputPdf, outFile, format = "png", dpi = 200) {
   // format: png or jpeg
   const device = (format === "jpeg" || format === "jpg") ? "jpeg" : "png16m";
+  // attempt to ensure some tmp space before heavy GS render (approximate)
+  try {
+    ensureTmpSpaceSync(50 * 1024); // require at least ~50MB for rendering temp operations
+  } catch (e) {
+    // log and continue; caller will handle failure
+    console.warn("Warning: low temp space before GS render:", e && e.message);
+  }
   // build gs command; write single page (first) for speed
-  // -dFirstPage=1 -dLastPage=1 ensures single page
-  // Use -dTextAlphaBits=4 -dGraphicsAlphaBits=4 for quality
   const gsCmd = `gs -dSAFER -dBATCH -dNOPAUSE -dFirstPage=1 -dLastPage=1 -sDEVICE=${device} -r${dpi} -dTextAlphaBits=4 -dGraphicsAlphaBits=4 -sOutputFile="${outFile}" "${inputPdf}"`;
   console.log("📄 gs render:", gsCmd);
   await runCmd(gsCmd);
@@ -215,7 +282,7 @@ async function convertAudio(input, outPath, targetExt) {
       cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -map 0:a -c:a aac -b:a 128k "${out}"`;
       break;
     case "flac":
-      // 🩵 FIX: ensure .flac extension and stable write
+      // ensure .flac extension and stable write
       out = fixOutputExtension(out, extRaw || "flac");
       cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -map 0:a -c:a flac "${out}"`;
       break;
@@ -258,8 +325,7 @@ async function convertVideo(input, outPath, targetExt) {
   let cmd;
 
   if (ext === "webm") {
-    // 🩵 FIX: faster VP8 profile (realtime deadline / cpu-used) to speed WebM encoding
-    // prefer VP8 for speed, fall back to VP9 or container copy if it fails
+    // faster VP8 profile (realtime deadline / cpu-used) to speed WebM encoding
     const vp8cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libvpx -b:v 1M -deadline realtime -cpu-used 6 -row-mt 1 -threads ${FFMPEG_THREADS} -c:a libopus -b:a 96k -f webm "${out}"`;
     console.log("🎬 ffmpeg (video - try vp8 fast):", vp8cmd);
     try {
@@ -314,7 +380,7 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
 
   // ---------------- PDF -> images (single-page) using Ghostscript -> fallback to ImageMagick
   if (inExt === "pdf" && ["png","jpg","jpeg","webp","tiff","bmp"].includes(ext)) {
-    // choose a safe target format (avoid producing TIFF if possible since it caused write errors)
+    // choose a safe target format (avoid producing TIFF if possible)
     const preferredFormat = (ext === "tiff" || ext === "bmp") ? "png" : (ext === "jpg" ? "jpeg" : ext);
     const tmpPrefix = path.join(tmpDir, safeOutputBase(path.parse(input).name));
     const tmpProduced = fixOutputExtension(`${tmpPrefix}`, extRequested || preferredFormat);
@@ -322,15 +388,14 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
     // First attempt: Ghostscript rendering (more reliable and with controlled memory)
     try {
       const gsFormat = (preferredFormat === "jpeg") ? "jpeg" : "png";
-      // choose dpi lower if memory issues happen; default 150-200 for good balance
-      const dpi = 200;
+      const dpi = (getFreeKbSync(tmpDir) < 150 * 1024) ? 150 : 200; // reduce DPI if low tmp space
       const gsOut = tmpProduced; // includes extension
       await renderPdfWithGs(input, gsOut, gsFormat, dpi);
       if (!fs.existsSync(gsOut)) throw new Error("Ghostscript did not produce output");
       // If requested webp, convert the produced png/jpeg to webp if ImageMagick available
       if (ext === "webp" && magickCmd) {
         const tmpWebp = fixOutputExtension(`${tmpPrefix}`, "webp");
-        await runCmd(`${magickCmd} "${gsOut}" "${tmpWebp}"`).catch(err => { throw new Error(`imagemagick failed: ${err.message}`); });
+        await runCmd(`${magickCmd} -limit memory ${process.env.IMAGEMAGICK_LIMIT_MEMORY || "256MB"} -limit map ${process.env.IMAGEMAGICK_LIMIT_MAP || "512MB"} "${gsOut}" "${tmpWebp}"`).catch(err => { throw new Error(`imagemagick failed: ${err.message}`); });
         await safeCleanup(gsOut);
         await flattenImageWhite(tmpWebp, out);
         await safeCleanup(tmpWebp);
@@ -379,11 +444,13 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
         }
 
         // ImageMagick path (preferred when gs fails)
-        const density = 150; // slightly lower to avoid heavy memory use
+        const density = (getFreeKbSync(tmpDir) < 150 * 1024) ? 150 : 200; // adapt density to available space
         const quality = 90;
         const pageSpec = `${input}[0]`;
         const tmpOut = fixOutputExtension(path.join(tmpDir, safeOutputBase(path.parse(input).name)), extRequested || preferredFormat);
-        const imgCmd = `${magickCmd} -density ${density} "${pageSpec}" -quality ${quality} -background white -alpha remove -flatten +repage -colorspace sRGB "${tmpOut}"`;
+        const memLimit = process.env.IMAGEMAGICK_LIMIT_MEMORY || "256MB";
+        const mapLimit = process.env.IMAGEMAGICK_LIMIT_MAP || "512MB";
+        const imgCmd = `${magickCmd} -limit memory ${memLimit} -limit map ${mapLimit} -density ${density} "${pageSpec}" -quality ${quality} -background white -alpha remove -flatten +repage -colorspace sRGB "${tmpOut}"`;
         console.log("📄 ImageMagick PDF->image:", imgCmd);
         await runCmd(imgCmd).catch(err => { throw new Error(`ImageMagick PDF->image failed: ${err.message}`); });
 
@@ -486,15 +553,15 @@ async function compressFile(input, outPath, inputExt) {
     cmd = `gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/screen -dNOPAUSE -dQUIET -dBATCH -sOutputFile="${out}" "${input}"`;
   } else if (imageExts.has(inputExt) || ["jpg","jpeg","png","webp"].includes(inputExt)) {
     if (["jpg","jpeg"].includes(inputExt)) {
-      cmd = `magick "${input}" -strip -sampling-factor 4:2:0 -quality 55 -interlace Plane -colorspace sRGB "${out}"`;
+      cmd = `magick -limit memory ${process.env.IMAGEMAGICK_LIMIT_MEMORY || "256MB"} -limit map ${process.env.IMAGEMAGICK_LIMIT_MAP || "512MB"} "${input}" -strip -sampling-factor 4:2:0 -quality 55 -interlace Plane -colorspace sRGB "${out}"`;
     } else if (inputExt === "png") {
       if (await hasCmd("pngquant")) {
         cmd = `pngquant --quality=50-80 --output "${out}" --force "${input}"`;
       } else {
-        cmd = `magick "${input}" -strip -quality 60 "${out}"`;
+        cmd = `magick -limit memory ${process.env.IMAGEMAGICK_LIMIT_MEMORY || "256MB"} -limit map ${process.env.IMAGEMAGICK_LIMIT_MAP || "512MB"} "${input}" -strip -quality 60 "${out}"`;
       }
     } else {
-      cmd = `magick "${input}" -strip -quality 60 "${out}"`;
+      cmd = `magick -limit memory ${process.env.IMAGEMAGICK_LIMIT_MEMORY || "256MB"} -limit map ${process.env.IMAGEMAGICK_LIMIT_MAP || "512MB"} "${input}" -strip -quality 60 "${out}"`;
     }
   } else if (audioExts.has(inputExt)) {
     cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -ac 2 -ar 44100 -b:a 96k "${out}"`;
@@ -575,7 +642,9 @@ router.post("/", (req, res) => {
           producedPath = await convertDocument(inputPath, outPath, requestedTargetRaw || requestedTarget || inputExt, tmpDir);
         } else if (imageExts.has(inputExt) || imageExts.has(requestedTarget)) {
           if (!magickCmd) throw new Error("ImageMagick not available");
-          const cmd = `${magickCmd} "${inputPath}" "${outPath}"`;
+          const memLimit = process.env.IMAGEMAGICK_LIMIT_MEMORY || "256MB";
+          const mapLimit = process.env.IMAGEMAGICK_LIMIT_MAP || "512MB";
+          const cmd = `${magickCmd} -limit memory ${memLimit} -limit map ${mapLimit} "${inputPath}" "${outPath}"`;
           console.log("🖼️ imagemagick:", cmd);
           await runCmd(cmd);
           producedPath = await ensureProperExtension(outPath, requestedTargetRaw || requestedTarget || inputExt);
@@ -648,3 +717,4 @@ router.post("/", (req, res) => {
 });
 
 module.exports = router;
+    
