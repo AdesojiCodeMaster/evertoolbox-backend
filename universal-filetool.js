@@ -156,7 +156,8 @@ async function flattenImageWhite(input, out) {
   // support either 'magick' or 'convert'
   const magickCmd = await findMagickCmd();
   if (magickCmd) {
-    const cmd = `${magickCmd} "${input}" -background white -alpha remove -alpha off "${out}"`;
+    // 🩵 FIX: stronger flatten flags to avoid dark backgrounds
+    const cmd = `${magickCmd} "${input}" -background white -alpha remove -flatten -colorspace sRGB "${out}"`;
     await runCmd(cmd);
   } else {
     await fsp.copyFile(input, out);
@@ -166,12 +167,14 @@ async function flattenImageWhite(input, out) {
 // ---------------- Audio conversion ----------------
 async function convertAudio(input, outPath, targetExt) {
   if (!fs.existsSync(input)) throw new Error("Input file not found");
-  const ext = (targetExt || path.extname(outPath)).toString().replace(/^\./, "").toLowerCase();
+  // keep casing provided by targetExt if present (requestedTargetRaw), else fallback to lowercased ext
+  const extRaw = (targetExt || path.extname(outPath)).toString().replace(/^\./, "");
+  const ext = (extRaw || "").toLowerCase();
   if (!ext) throw new Error("No target audio extension specified");
 
-  // prefer to preserve exact requested extension casing if provided in outPath
-  let out = fixOutputExtension(outPath, targetExt || ext);
-  if (!path.extname(out)) out = `${out}.${targetExt || ext}`;
+  // prefer to preserve exact requested extension casing if provided in outPath/targetExt
+  let out = fixOutputExtension(outPath, extRaw || ext);
+  if (!path.extname(out)) out = `${out}.${extRaw || ext}`;
 
   let cmd;
   switch (ext) {
@@ -185,24 +188,25 @@ async function convertAudio(input, outPath, targetExt) {
       cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:a libvorbis -q:a 4 "${out}"`;
       break;
     case "opus":
-      out = fixOutputExtension(out, targetExt || "opus");
+      out = fixOutputExtension(out, extRaw || "opus");
       cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -map 0:a -c:a libopus -b:a 96k -vn -f opus "${out}"`;
       break;
     case "aac":
-      out = fixOutputExtension(out, targetExt || "aac");
+      out = fixOutputExtension(out, extRaw || "aac");
       // raw ADTS AAC stream
       cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -map 0:a -c:a aac -b:a 128k -f adts "${out}"`;
       break;
     case "m4a":
-      out = fixOutputExtension(out, targetExt || "m4a");
+      out = fixOutputExtension(out, extRaw || "m4a");
       cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -map 0:a -c:a aac -b:a 128k "${out}"`;
       break;
     case "flac":
-      // ensure ffmpeg writes a file with extension; add safe flags
+      // 🩵 FIX: ensure .flac extension and stable write
+      out = fixOutputExtension(out, extRaw || "flac");
       cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -map 0:a -c:a flac "${out}"`;
       break;
     case "webm":
-      out = fixOutputExtension(out, targetExt || "webm");
+      out = fixOutputExtension(out, extRaw || "webm");
       cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -map 0:a -vn -c:a libopus -b:a 96k -f webm "${out}"`;
       break;
     default:
@@ -214,7 +218,7 @@ async function convertAudio(input, outPath, targetExt) {
 
   // If ffmpeg wrote output without extension, ensure it has one
   if (!path.extname(out)) {
-    const outWithExt = `${out}.${targetExt || ext}`;
+    const outWithExt = `${out}.${extRaw || ext}`;
     if (fs.existsSync(out)) {
       await fsp.rename(out, outWithExt);
       out = outWithExt;
@@ -224,34 +228,36 @@ async function convertAudio(input, outPath, targetExt) {
   if (!fs.existsSync(out)) throw new Error("Audio conversion failed: output missing");
   if (!(await waitForStableFileSize(out))) throw new Error("Audio conversion failed: output unstable or empty");
 
-  return await ensureProperExtension(out, targetExt || ext);
+  return await ensureProperExtension(out, extRaw || ext);
 }
 
 // ---------------- Video conversion ----------------
 async function convertVideo(input, outPath, targetExt) {
   if (!fs.existsSync(input)) throw new Error("Input file not found");
-  const ext = (targetExt || path.extname(outPath)).toString().replace(/^\./, "").toLowerCase();
+  const extRaw = (targetExt || path.extname(outPath)).toString().replace(/^\./, "");
+  const ext = (extRaw || "").toLowerCase();
   if (!ext) throw new Error("No target video extension specified");
 
-  let out = fixOutputExtension(outPath, targetExt || ext);
-  if (!path.extname(out)) out = `${out}.${targetExt || ext}`;
+  let out = fixOutputExtension(outPath, extRaw || ext);
+  if (!path.extname(out)) out = `${out}.${extRaw || ext}`;
 
   let cmd;
 
   if (ext === "webm") {
-    // prefer VP8 for speed (faster than VP9) and keep audio+video
-    const vp8cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libvpx -b:v 1M -cpu-used 5 -row-mt 1 -c:a libopus -b:a 96k -f webm "${out}"`;
+    // 🩵 FIX: faster VP8 profile (realtime deadline / cpu-used) to speed WebM encoding
+    // prefer VP8 for speed, fall back to VP9 or container copy if it fails
+    const vp8cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libvpx -b:v 1M -deadline realtime -cpu-used 6 -row-mt 1 -c:a libopus -b:a 96k -f webm "${out}"`;
     console.log("🎬 ffmpeg (video - try vp8 fast):", vp8cmd);
     try {
       await runCmd(vp8cmd);
     } catch (errVp8) {
       console.warn("VP8 quick path failed, falling back to VP9:", errVp8 && errVp8.message);
-      const tryVp9 = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libvpx-vp9 -b:v 1M -cpu-used 4 -row-mt 1 -c:a libopus -b:a 96k -f webm "${out}"`;
+      const tryVp9 = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libvpx-vp9 -b:v 1M -cpu-used 4 -row-mt 1 -deadline good -c:a libopus -b:a 96k -f webm "${out}"`;
       console.log("🎬 ffmpeg (video - try vp9):", tryVp9);
       try {
         await runCmd(tryVp9);
       } catch (errVp9) {
-        console.warn("VP9 failed, falling back to copy container:", errVp9 && errVp9.message);
+        console.warn("VP9 failed, falling back to container copy:", errVp9 && errVp9.message);
         const fallbackCopy = `ffmpeg -y -i "${input}" -c copy "${out}"`;
         console.log("🎬 ffmpeg (video - container copy):", fallbackCopy);
         await runCmd(fallbackCopy).catch(err => { throw new Error(err.message); });
@@ -276,7 +282,7 @@ async function convertVideo(input, outPath, targetExt) {
   if (!fs.existsSync(out)) throw new Error("Video conversion failed: output missing");
   if (!(await waitForStableFileSize(out))) throw new Error("Video conversion failed: output unstable or empty");
 
-  return await ensureProperExtension(out, targetExt || ext);
+  return await ensureProperExtension(out, extRaw || ext);
 }
 
 // ---------------- Document conversion ----------------
@@ -289,90 +295,81 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
   const out = fixOutputExtension(outPath, extRequested);
   tmpDir = tmpDir || path.dirname(input);
 
-  // Prefer pdftocairo if available (better color accuracy & direct jpeg)
-  const pdftocairoAvailable = await hasPdftocairo();
+  // Use ImageMagick + Ghostscript for PDF -> image conversions (works where poppler tools fail)
   const magickCmd = await findMagickCmd();
 
-  // PDF -> images (single-page)
+  // ---------------- PDF -> images (single-page) using ImageMagick (no pdftoppm/pdftocairo)
   if (inExt === "pdf" && ["png","jpg","jpeg","webp","tiff","bmp"].includes(ext)) {
-    const format = (ext === "jpg" || ext === "jpeg") ? "jpeg" : (ext === "webp" ? "png" : ext); // pdftocairo doesn't reliably write webp -> convert later
-    const prefix = path.join(tmpDir, safeOutputBase(path.parse(input).name));
-    if (pdftocairoAvailable && format !== "webp") {
-      // use pdftocairo for jpeg/png/tiff which is reliable
-      const cmd = `pdftocairo -singlefile -${format} -r 300 "${input}" "${prefix}"`;
-      console.log("📄 pdftocairo:", cmd);
-      await runCmd(cmd).catch(err => { throw new Error(`pdftocairo failed: ${err.message}`); });
-      const produced = `${prefix}.${format}`;
-      if (!fs.existsSync(produced)) {
-        const alt = `${prefix}-1.${format}`;
-        if (fs.existsSync(alt)) { await fsp.rename(alt, out); return out; }
-        throw new Error("pdftocairo did not produce page image");
-      }
-      // if requested webp, convert produced png/jpeg to webp via ImageMagick
-      if (ext === "webp") {
-        const tmpWebp = fixOutputExtension(produced, `webp`);
-        if (magickCmd) {
-          await runCmd(`${magickCmd} "${produced}" "${tmpWebp}"`).catch(err => { throw new Error(`imagemagick failed: ${err.message}`); });
-          await safeCleanup(produced);
-          await flattenImageWhite(tmpWebp, out);
-          await safeCleanup(tmpWebp);
-          return out;
-        } else {
-          await fsp.rename(produced, out);
-          return out;
-        }
-      }
-      // flatten produced to white background (handles transparency/dark bg)
-      await flattenImageWhite(produced, out);
-      await safeCleanup(produced);
-      // normalize jpeg casing exactly as requested
-      if ((extRequested === "JPG" || extRequested === "jpg" || extRequested === "jpeg") && (ext === "jpeg" || ext === "jpg")) {
-        // if user requested uppercase JPG specifically, rename accordingly
-        const desired = fixOutputExtension(out, extRequested);
-        if (desired !== out && fs.existsSync(out)) {
-          await fsp.rename(out, desired).catch(()=>{});
-          return desired;
-        }
-      }
-      return out;
-    } else {
-      // fallback to pdftoppm (older) but avoid unsupported -webp option
-      const cmd = `pdftoppm -f 1 -singlefile -${format} "${input}" "${prefix}"`;
-      console.log("📄 pdftoppm (fallback):", cmd);
+    if (!magickCmd) {
+      // If no ImageMagick, try pdftoppm fallback (older behavior)
+      const formatFallback = (ext === "jpg" || ext === "jpeg") ? "jpeg" : ext;
+      const prefix = path.join(tmpDir, safeOutputBase(path.parse(input).name));
+      const cmd = `pdftoppm -f 1 -singlefile -${formatFallback} "${input}" "${prefix}"`;
+      console.log("📄 pdftoppm fallback:", cmd);
       await runCmd(cmd).catch(err => { throw new Error(`pdftoppm failed: ${err.message}`); });
-      const produced = `${prefix}.${format}`;
+      const produced = `${prefix}.${formatFallback}`;
       if (!fs.existsSync(produced)) {
-        const alt = `${prefix}-1.${format}`;
+        const alt = `${prefix}-1.${formatFallback}`;
         if (fs.existsSync(alt)) { await fsp.rename(alt, out); return out; }
         throw new Error("pdftoppm did not produce page image");
       }
-      if (ext === "webp" && magickCmd) {
-        const tmpWebp = fixOutputExtension(produced, `webp`);
-        await runCmd(`${magickCmd} "${produced}" "${tmpWebp}"`).catch(err => { throw new Error(`imagemagick failed: ${err.message}`); });
-        await safeCleanup(produced);
-        await flattenImageWhite(tmpWebp, out);
-        await safeCleanup(tmpWebp);
-        return out;
-      }
+      // flatten to white
       await flattenImageWhite(produced, out);
       await safeCleanup(produced);
-      // honor requested casing for jpeg/JPG
-      if ((extRequested === "JPG" || extRequested === "jpg" || extRequested === "jpeg") && (ext === "jpeg" || ext === "jpg")) {
+      // honor requested casing for JPG/JPEG
+      if ((extRequested === "JPG" || extRequested === "jpg" || extRequested === "jpeg") && (formatFallback === "jpeg")) {
         const desired = fixOutputExtension(out, extRequested);
-        if (desired !== out && fs.existsSync(out)) {
-          await fsp.rename(out, desired).catch(()=>{});
-          return desired;
-        }
+        if (desired !== out && fs.existsSync(out)) { await fsp.rename(out, desired).catch(()=>{}); return desired; }
       }
       return out;
     }
+
+    // ImageMagick path (preferred): render first page to requested image
+    // use density 200 for good quality, flatten to white to avoid dark bg
+    // use input.pdf[0] to get first page only
+    const density = 200;
+    const quality = 90;
+    const pageSpec = `${input}[0]`;
+    // produce temporary file with requested casing
+    const tmpOut = fixOutputExtension(path.join(tmpDir, safeOutputBase(path.parse(input).name)), extRequested || ext);
+    // build command depending on magickCmd ('magick' vs 'convert')
+    // For ImageMagick v7 'magick' prefix is used, for v6 'convert' is used.
+    const imgCmd = `${magickCmd} -density ${density} "${pageSpec}" -quality ${quality} -background white -alpha remove -flatten -colorspace sRGB "${tmpOut}"`;
+    console.log("📄 ImageMagick PDF->image:", imgCmd);
+    await runCmd(imgCmd).catch(err => { throw new Error(`ImageMagick PDF->image failed: ${err.message}`); });
+
+    // ensure produced exists
+    if (!fs.existsSync(tmpOut)) {
+      // try common alternate produced names (ImageMagick sometimes appends page numbers)
+      const alt = fixOutputExtension(tmpOut.replace(/\.\w+$/, '' ) + '-0', extRequested || ext);
+      if (fs.existsSync(alt)) {
+        await fsp.rename(alt, out).catch(()=>{});
+        return out;
+      }
+      throw new Error("ImageMagick failed to produce PDF page image");
+    }
+
+    // final flatten again to ensure white background and move to desired out path
+    await flattenImageWhite(tmpOut, out);
+    await safeCleanup(tmpOut);
+
+    // honor requested casing for JPG/JPEG (user may request 'JPG' uppercase)
+    if ((ext === "jpeg" || ext === "jpg") && extRequested && extRequested !== ext) {
+      const desired = fixOutputExtension(out, extRequested);
+      if (desired !== out && fs.existsSync(out)) {
+        await fsp.rename(out, desired).catch(()=>{});
+        return desired;
+      }
+    }
+
+    return out;
   }
 
-  // PDF -> text / md
+  // ---------------- PDF -> text / md using pdftotext (no rasterization)
   if (inExt === "pdf" && ["txt","md"].includes(ext)) {
     if (await hasCmd("pdftotext")) {
       const mid = path.join(tmpDir, `${safeOutputBase(path.parse(input).name)}.txt`);
-      // extract plain text without rendering background
+      // extract plain text without rendering background: pdftotext extracts text only
       await runCmd(`pdftotext "${input}" "${mid}"`).catch(err => { throw new Error(`pdftotext failed: ${err.message}`); });
       if (ext === "md") {
         if (await hasCmd("pandoc")) {
@@ -381,7 +378,7 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
           await safeCleanup(mid);
           return out;
         } else {
-          // if pandoc not available, return txt (renamed to .md) as fallback
+          // if pandoc not available, return the raw text renamed to .md
           await fsp.rename(mid, out).catch(()=>{});
           return out;
         }
@@ -403,7 +400,7 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
     }
   }
 
-  // Office conversions via LibreOffice
+  // Office conversions via LibreOffice (unchanged)
   if (officeExts.has(inExt) || officeExts.has(ext) || inExt === "pdf") {
     const cmd = `libreoffice --headless --invisible --nologo --nodefault --nolockcheck --convert-to ${ext} "${input}" --outdir "${tmpDir}"`;
     console.log("📄 libreoffice:", cmd);
