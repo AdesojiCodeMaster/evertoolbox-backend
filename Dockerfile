@@ -1,21 +1,12 @@
 # ------------------------------------------------------------
-# ⚡ EverToolbox Backend Dockerfile (Optimized Multi-Stage)
-# Lighter, faster, and pre-tuned for Render/Netlify backends
+# ⚡ EverToolbox Backend Dockerfile (Render-Optimized)
+# Faster conversions: tuned for ffmpeg, LibreOffice, ImageMagick
 # ------------------------------------------------------------
 
-# === Stage 1: Build dependencies ===
-FROM node:20-bullseye AS build
+FROM node:20-bullseye
 
+# Set working directory
 WORKDIR /app
-
-# Copy only package files first for better layer caching
-COPY package*.json ./
-
-# Install only production deps (no dev) to reduce size
-RUN npm ci --only=production
-
-# === Stage 2: Runtime image ===
-FROM node:20-bullseye AS runtime
 
 # ------------------------------------------------------------
 # 🧩 Install system dependencies
@@ -30,35 +21,50 @@ RUN apt-get update && \
       poppler-utils \
       fonts-dejavu-core \
       && \
-    # ✅ Allow ImageMagick to read/write PDFs
+    # ✅ Fix ImageMagick security policy for PDF conversion
     sed -i 's/<policy domain="coder" rights="none" pattern="PDF" \/>/<policy domain="coder" rights="read|write" pattern="PDF" \/>/' /etc/ImageMagick-6/policy.xml || true && \
     sed -i 's/<policy domain="coder" rights="none" pattern="PDF" \/>/<policy domain="coder" rights="read|write" pattern="PDF" \/>/' /etc/ImageMagick-7/policy.xml || true && \
+    # ✅ Clean cache
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # ------------------------------------------------------------
-# ⚙️ Environment tuning
+# ⚙️ Performance environment variables
 # ------------------------------------------------------------
-ENV NODE_ENV=production
-ENV PORT=10000
 ENV TMPDIR=/dev/shm
 ENV FFMPEG_THREADS=2
+RUN mkdir -p /root/.config/libreoffice/4/user
 
 # ------------------------------------------------------------
-# 🧠 Copy pre-built node_modules from build stage
+# 📦 Install Node dependencies
 # ------------------------------------------------------------
-WORKDIR /app
-COPY --from=build /app/node_modules ./node_modules
+COPY package*.json ./
+
+# ✅ Use npm install for flexibility (Render-friendly)
+RUN npm install --omit=dev
 
 # ------------------------------------------------------------
-# 📦 Copy source code
+# 🧠 Copy application source code
 # ------------------------------------------------------------
 COPY . .
 
-# Optional: prewarm major tools (for Render cold starts)
-RUN ffmpeg -version && libreoffice --headless --version && convert -version && gs --version && pandoc -v && echo "✅ Tools verified."
-
 # ------------------------------------------------------------
-# 🌐 Expose port and launch
+# 🌐 Environment & Ports
 # ------------------------------------------------------------
 EXPOSE 10000
+ENV PORT=10000
+ENV NODE_ENV=production
+
+# ------------------------------------------------------------
+# 🪄 Prewarm key tools (optional but helpful)
+# ------------------------------------------------------------
+RUN ffmpeg -version && \
+    libreoffice --headless --version && \
+    convert -version && \
+    gs --version && \
+    pandoc -v && \
+    echo "✅ Prewarm complete."
+
+# ------------------------------------------------------------
+# 🚀 Start backend
+# ------------------------------------------------------------
 CMD ["node", "server.js"]
