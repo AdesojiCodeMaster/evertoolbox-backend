@@ -1,6 +1,6 @@
-// universal-filetool.js (FINAL - naked single-file downloads only)
-// Requirements in the runtime image: ffmpeg, libreoffice, poppler-utils (pdftoppm/pdftotext), ghostscript (gs),
-// imagemagick (magick or convert), pandoc (optional). No zip fallback is used.
+// universal-filetool.js (FINAL - fully integrated, naked downloads only)
+// Requirements in runtime image: ffmpeg, libreoffice, poppler-utils (pdftoppm/pdftotext), ghostscript (gs),
+// imagemagick (magick or convert), pandoc (optional). No zip fallback. Uses /dev/shm when present.
 
 const express = require("express");
 const multer = require("multer");
@@ -10,25 +10,29 @@ const fsp = fs.promises;
 const path = require("path");
 const os = require("os");
 const { exec } = require("child_process");
+const { pipeline } = require("stream");
+const { promisify } = require("util");
 const mime = require("mime-types");
 
+const pipe = promisify(pipeline);
 const router = express.Router();
 
 const TMP_DIR = process.env.TMPDIR || (fs.existsSync("/dev/shm") ? "/dev/shm" : os.tmpdir());
-const FFMPEG_THREADS = parseInt(process.env.FFMPEG_THREADS || "2", 10);
+const FFMPEG_THREADS = String(process.env.FFMPEG_THREADS || "2");
 const STABLE_CHECK_MS = 200;
 const STABLE_CHECK_ROUNDS = 3;
+const STABLE_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes for large conversions
 
-// Multer (upload)
+// ---------------- Multer upload ----------------
 const upload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => cb(null, TMP_DIR),
     filename: (req, file, cb) => cb(null, `${Date.now()}-${uuidv4()}-${file.originalname.replace(/\s+/g, "_")}`)
   }),
-  limits: { fileSize: 1024 * 1024 * 1024 } // 1GB
+  limits: { fileSize: 1024 * 1024 * 1024 } // 1 GB
 }).single("file");
 
-// Exec helper
+// ---------------- Exec wrapper ----------------
 function runCmd(cmd, opts = {}) {
   return new Promise((resolve, reject) => {
     exec(cmd, { maxBuffer: 1024 * 1024 * 1024, ...opts }, (err, stdout, stderr) => {
@@ -49,7 +53,7 @@ async function findMagickCmd() {
   catch { try { await runCmd("convert -version"); return "convert"; } catch { return null; } }
 }
 
-// Utilities
+// ---------------- Utilities ----------------
 function extOfFilename(name) { return (path.extname(name || "").replace(".", "") || "").toLowerCase(); }
 function sanitizeFilename(name) { return path.basename(name).replace(/[^a-zA-Z0-9._\- ]/g, "_"); }
 function safeOutputBase(originalName) { return `${Date.now()}-${uuidv4()}-${path.parse(originalName).name.replace(/\s+/g, "_")}`; }
@@ -67,8 +71,14 @@ async function ensureProperExtension(filePath, targetExt) {
     if (!clean) return filePath;
     const newPath = path.join(path.dirname(filePath), `${path.parse(filePath).name}.${clean}`);
     if (newPath === filePath) return filePath;
-    if (fs.existsSync(filePath)) { await fsp.rename(filePath, newPath); console.log("🔧 Fixed extension:", newPath); return newPath; }
-  } catch (e) { console.warn("ensureProperExtension error:", e.message); }
+    if (fs.existsSync(filePath)) {
+      await fsp.rename(filePath, newPath);
+      console.log("🔧 Fixed extension:", newPath);
+      return newPath;
+    }
+  } catch (e) {
+    console.warn("ensureProperExtension error:", e && e.message);
+  }
   return filePath;
 }
 async function safeCleanup(filePath) {
@@ -79,12 +89,13 @@ async function safeCleanup(filePath) {
       console.log("🧹 Temp deleted:", filePath);
     }
   } catch (e) {
-    if (e.code !== "ENOENT") console.warn("cleanup failed:", e.message);
+    // suppress ENOENT and log others
+    if (e && e.code !== "ENOENT") console.warn("cleanup failed:", e && e.message);
   }
 }
 
 // Wait until file exists and its size is stable for STABLE_CHECK_ROUNDS
-async function waitForStableFileSize(filePath, timeoutMs = 60000) {
+async function waitForStableFileSize(filePath, timeoutMs = STABLE_TIMEOUT_MS) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     if (!fs.existsSync(filePath)) { await new Promise(r => setTimeout(r, STABLE_CHECK_MS)); continue; }
@@ -103,42 +114,25 @@ async function waitForStableFileSize(filePath, timeoutMs = 60000) {
 function mapMimeByExt(ext) {
   const e = (ext || "").replace(/^\./, "").toLowerCase();
   const map = {
-    wav: "audio/wav",
-    mp3: "audio/mpeg",
-    opus: "audio/opus",
-    ogg: "audio/ogg",
-    m4a: "audio/mp4",
-    aac: "audio/aac",
-    webm: "video/webm",
-    mp4: "video/mp4",
-    avi: "video/x-msvideo",
-    mov: "video/quicktime",
-    mkv: "video/x-matroska",
-    png: "image/png",
-    jpg: "image/jpeg",
-    jpeg: "image/jpeg",
-    webp: "image/webp",
-    gif: "image/gif",
-    pdf: "application/pdf",
-    txt: "text/plain",
-    md: "text/markdown",
-    html: "text/html",
+    wav: "audio/wav", mp3: "audio/mpeg", opus: "audio/opus", ogg: "audio/ogg", m4a: "audio/mp4",
+    aac: "audio/aac", webm: "video/webm", mp4: "video/mp4", avi: "video/x-msvideo", mov: "video/quicktime",
+    mkv: "video/x-matroska", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp",
+    gif: "image/gif", pdf: "application/pdf", txt: "text/plain", md: "text/markdown", html: "text/html",
     docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
   };
   return map[e] || mime.lookup(e) || "application/octet-stream";
 }
 
-// Type sets
 const imageExts = new Set(["jpg","jpeg","png","webp","gif","tiff","bmp"]);
 const audioExts = new Set(["mp3","wav","m4a","ogg","opus","flac","aac","webm"]);
 const videoExts = new Set(["mp4","avi","mov","webm","mkv","m4v"]);
 const officeExts = new Set(["doc","docx","ppt","pptx","xls","xlsx","odt","ods","odp"]);
 const docExts = new Set(["pdf","txt","md","html"]);
 
-// Prewarm (non-blocking)
+// ---------------- Prewarm (non-blocking) ----------------
 (async function prewarm() {
   try {
-    console.log("🔥 Prewarming tools (ffmpeg, libreoffice, pdftoppm, pdftotext, magick/convert, gs)...");
+    console.log("🔥 Prewarming tools...");
     await Promise.allSettled([
       runCmd("ffmpeg -version"),
       runCmd("libreoffice --headless --version").catch(()=>{}),
@@ -148,16 +142,15 @@ const docExts = new Set(["pdf","txt","md","html"]);
       runCmd("gs --version").catch(()=>{})
     ]);
     console.log("🔥 Prewarm done");
-  } catch (e) { console.warn("Prewarm error:", e.message); }
+  } catch (e) { console.warn("Prewarm notice:", e && e.message); }
 })();
 
-// Flatten image to white background (avoid dark background issues)
+// ---------------- Helper: flatten image to white ----------------
 async function flattenImageWhite(input, out) {
   if (await hasCmd("magick")) {
     const cmd = `magick "${input}" -background white -alpha remove -alpha off "${out}"`;
     await runCmd(cmd);
   } else {
-    // fallback to copy
     await fsp.copyFile(input, out);
   }
 }
@@ -184,7 +177,6 @@ async function convertAudio(input, outPath, targetExt) {
       break;
     case "opus":
       out = fixOutputExtension(out, "opus");
-      // ensure native .opus container and audio mapping
       cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -map 0:a -c:a libopus -b:a 96k -vn -f opus "${out}"`;
       break;
     case "aac":
@@ -226,20 +218,33 @@ async function convertVideo(input, outPath, targetExt) {
   if (!path.extname(out)) out = `${out}.${ext}`;
 
   let cmd;
+
   if (ext === "webm") {
-    // produce full video+audio webm (vp8 for speed; if vp9 desired change to libvpx-vp9)
-    cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libvpx -b:v 900k -cpu-used 5 -row-mt 1 -threads ${FFMPEG_THREADS} -c:a libopus -b:a 96k -f webm "${out}"`;
+    // prefer VP9 for quality but try VP9 then fallback to VP8 if it fails.
+    const tryVp9 = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libvpx-vp9 -b:v 1M -cpu-used 4 -row-mt 1 -c:a libopus -b:a 96k -f webm "${out}"`;
+    console.log("🎬 ffmpeg (video - try vp9):", tryVp9);
+    try {
+      await runCmd(tryVp9);
+    } catch (errVp9) {
+      console.warn("VP9 failed, falling back to VP8:", errVp9 && errVp9.message);
+      const fallbackVp8 = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libvpx -b:v 1M -cpu-used 5 -row-mt 1 -c:a libopus -b:a 96k -f webm "${out}"`;
+      console.log("🎬 ffmpeg (video - fallback vp8):", fallbackVp8);
+      await runCmd(fallbackVp8).catch(err => { throw new Error(err.message); });
+    }
   } else if (ext === "mkv") {
     cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libx264 -preset ultrafast -crf 28 -c:a aac -b:a 96k "${out}"`;
+    console.log("🎬 ffmpeg (video):", cmd);
+    await runCmd(cmd).catch(err => { throw new Error(err.message); });
   } else if (["mp4","mov","m4v","avi"].includes(ext)) {
     cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libx264 -preset fast -crf 28 -c:a aac -b:a 128k "${out}"`;
+    console.log("🎬 ffmpeg (video):", cmd);
+    await runCmd(cmd).catch(err => { throw new Error(err.message); });
   } else {
     // container-only copy
     cmd = `ffmpeg -y -i "${input}" -c copy "${out}"`;
+    console.log("🎬 ffmpeg (container copy):", cmd);
+    await runCmd(cmd).catch(err => { throw new Error(err.message); });
   }
-
-  console.log("🎬 ffmpeg (video):", cmd);
-  await runCmd(cmd).catch(err => { throw new Error(err.message); });
 
   if (!fs.existsSync(out)) throw new Error("Video conversion failed: output missing");
   if (!(await waitForStableFileSize(out))) throw new Error("Video conversion failed: output unstable or empty");
@@ -255,7 +260,7 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
   const out = fixOutputExtension(outPath, ext);
   tmpDir = tmpDir || path.dirname(input);
 
-  // PDF -> images
+  // PDF -> images (single-page)
   if (inExt === "pdf" && ["png","jpg","jpeg","webp"].includes(ext)) {
     const format = (ext === "jpg" || ext === "jpeg") ? "jpeg" : ext;
     const prefix = path.join(tmpDir, safeOutputBase(path.parse(input).name));
@@ -268,7 +273,6 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
       if (fs.existsSync(alt)) { await fsp.rename(alt, out); return out; }
       throw new Error("pdftoppm did not produce page image");
     }
-    // flatten to white to avoid dark bg issues
     await flattenImageWhite(produced, out);
     await safeCleanup(produced);
     return out;
@@ -281,10 +285,10 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
       await runCmd(`pdftotext "${input}" "${mid}"`).catch(err => { throw new Error(`pdftotext failed: ${err.message}`); });
       if (ext === "md" && await hasCmd("pandoc")) { await runCmd(`pandoc "${mid}" -o "${out}"`).catch(err => { throw new Error(`pandoc failed: ${err.message}`); }); await safeCleanup(mid); return out; }
       await fsp.rename(mid, out); return out;
-    } else { throw new Error("pdftotext is not available for PDF->text conversion"); }
+    } else throw new Error("pdftotext not available for PDF->text conversion");
   }
 
-  // PDF -> docx via pdftotext + pandoc
+  // PDF -> docx via pdftotext + pandoc (best-effort)
   if (inExt === "pdf" && ext === "docx") {
     if (await hasCmd("pdftotext") && await hasCmd("pandoc")) {
       const mid = path.join(tmpDir, `${safeOutputBase(path.parse(input).name)}.txt`);
@@ -297,16 +301,13 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
 
   // Office conversions via LibreOffice
   if (officeExts.has(inExt) || officeExts.has(ext) || inExt === "pdf") {
-    // attempt conversion; if it fails, return error (no zip fallback)
     const cmd = `libreoffice --headless --invisible --nologo --nodefault --nolockcheck --convert-to ${ext} "${input}" --outdir "${tmpDir}"`;
     console.log("📄 libreoffice:", cmd);
     await runCmd(cmd).catch(err => { throw new Error(`LibreOffice conversion failed: ${err.message}`); });
     const gen = path.join(tmpDir, `${path.parse(input).name}.${ext}`);
     if (!fs.existsSync(gen)) throw new Error(`LibreOffice failed to produce ${ext}`);
-    // If image output, flatten white
-    if (["png","jpg","jpeg","webp"].includes(ext)) {
-      await flattenImageWhite(gen, gen);
-    }
+    // flatten produced images to avoid dark backgrounds
+    if (["png","jpg","jpeg","webp"].includes(ext)) await flattenImageWhite(gen, gen);
     await fsp.rename(gen, out).catch(()=>{});
     if (!(await waitForStableFileSize(out))) throw new Error("Document conversion failed: output unstable or empty");
     return out;
@@ -315,7 +316,7 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
   throw new Error(`Unsupported document conversion: ${inExt} -> ${ext}`);
 }
 
-// ---------------- Compression (heavy) - overwrites same extension
+// ---------------- Compression (heavy) - overwrite same extension ----------------
 async function compressFile(input, outPath, inputExt) {
   if (!fs.existsSync(input)) throw new Error("Input file not found");
   inputExt = (inputExt || extOfFilename(input)).replace(/^\./, "").toLowerCase();
@@ -345,7 +346,7 @@ async function compressFile(input, outPath, inputExt) {
       cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libx264 -preset veryfast -crf 35 -c:a aac -b:a 96k "${out}"`;
     }
   } else if (officeExts.has(inputExt) || docExts.has(inputExt)) {
-    // convert to PDF then compress, return compressed PDF (naked file)
+    // convert to PDF then compress -> return compressed PDF (naked file)
     const tmpPdf = fixOutputExtension(outPath, "pdf");
     if (await hasCmd("pandoc") && docExts.has(inputExt)) {
       await runCmd(`pandoc "${input}" -o "${tmpPdf}"`).catch(()=>{});
@@ -371,8 +372,9 @@ async function compressFile(input, outPath, inputExt) {
 
 // ---------------- Route: POST '/' ----------------
 router.post("/", (req, res) => {
-  try { req.setTimeout(0); } catch {}
-  try { res.setTimeout(0); } catch {}
+  // disable default timeouts for long conversions
+  try { req.setTimeout(0); } catch (e) {}
+  try { res.setTimeout(0); } catch (e) {}
 
   upload(req, res, async function (err) {
     if (err) return res.status(400).json({ error: err.message });
@@ -403,7 +405,6 @@ router.post("/", (req, res) => {
         producedPath = await compressFile(inputPath, outPath, inputExt);
       } else { // convert
         if (audioExts.has(inputExt) || audioExts.has(effectiveTarget)) {
-          made: { }
           producedPath = await convertAudio(inputPath, outPath, effectiveTarget);
         } else if (videoExts.has(inputExt) || videoExts.has(effectiveTarget)) {
           producedPath = await convertVideo(inputPath, outPath, effectiveTarget);
@@ -415,7 +416,7 @@ router.post("/", (req, res) => {
           console.log("🖼️ imagemagick:", cmd);
           await runCmd(cmd);
           producedPath = await ensureProperExtension(outPath, effectiveTarget);
-          // flatten to white to avoid any dark bg artifacts
+          // flatten to white to avoid dark background artifacts
           if (["png","jpg","jpeg","webp"].includes(extOfFilename(producedPath))) {
             const tmpFlat = fixOutputExtension(producedPath, `flat.${extOfFilename(producedPath)}`);
             await flattenImageWhite(producedPath, tmpFlat);
@@ -426,15 +427,16 @@ router.post("/", (req, res) => {
         }
       }
 
-      // Validate produced file (no zips, no folders)
+      // Validate produced file
       if (!producedPath || !fs.existsSync(producedPath)) throw new Error("Output not produced.");
       if (!(await waitForStableFileSize(producedPath))) throw new Error("Produced file is empty or unstable.");
 
-      // Ensure extension matches contract
+      // Ensure final extension
       if (mode === "compress") {
         producedPath = await ensureProperExtension(producedPath, inputExt);
       } else {
-        producedPath = await ensureProperExtension(producedPath, requestedTarget || extOfFilename(producedPath) || inputExt);
+        const finalTarget = requestedTarget || extOfFilename(producedPath) || inputExt;
+        producedPath = await ensureProperExtension(producedPath, finalTarget);
       }
 
       const outExt = extOfFilename(producedPath);
@@ -442,7 +444,7 @@ router.post("/", (req, res) => {
       const mimeType = mapMimeByExt(outExt);
       const stat = fs.statSync(producedPath);
 
-      // Stream file only after fully written and stable
+      // Stream file using pipeline and wait for completion before cleanup (prevents premature close / network fail)
       res.writeHead(200, {
         "Content-Type": mimeType,
         "Content-Length": stat.size,
@@ -450,22 +452,26 @@ router.post("/", (req, res) => {
         "Cache-Control": "no-cache, no-store, must-revalidate",
       });
 
-      const stream = fs.createReadStream(producedPath);
-      stream.pipe(res);
+      const readStream = fs.createReadStream(producedPath);
 
-      const cleanupBoth = async () => { await safeCleanup(producedPath); await safeCleanup(inputPath); };
-      res.on("finish", cleanupBoth);
-      res.on("close", cleanupBoth);
-      stream.on("error", async (err) => { console.error("Stream error:", err && err.message); await cleanupBoth(); });
+      // When pipeline resolves, the full file has been sent.
+      await pipe(readStream, res);
+
+      // cleanup only after full send
+      await safeCleanup(producedPath);
+      await safeCleanup(inputPath);
+      // NOTE: response already ended by pipeline
 
     } catch (e) {
       console.error("❌ Conversion/Compression error:", e && e.message);
-      try { if (producedPath) await safeCleanup(producedPath); } catch {}
+      // try to remove partial produced file if any
+      try { if (producedPath) await safeCleanup(producedPath); } catch (er) {}
       await safeCleanup(inputPath);
-      if (!res.headersSent) res.status(500).json({ error: e.message });
+      if (!res.headersSent) return res.status(500).json({ error: e.message });
+      // if headers already sent, we can't send JSON; just end connection
+      try { res.end(); } catch {}
     }
   });
 });
 
 module.exports = router;
-                     
