@@ -1,5 +1,5 @@
 # ------------------------------------------------------------
-# ⚡ EverToolbox Backend Dockerfile (Render-Optimized)
+# ⚡ EverToolbox Backend Dockerfile (Render-Optimized & Compatible)
 # Faster conversions: tuned for ffmpeg, LibreOffice, ImageMagick
 # ------------------------------------------------------------
 
@@ -38,19 +38,15 @@ RUN apt-get update && \
 # ------------------------------------------------------------
 # ⚙️ Performance tuning
 # ------------------------------------------------------------
-# Use in-memory tmpfs for faster temporary I/O
 ENV TMPDIR=/dev/shm
-
-# Optimize ffmpeg threading and video encoding
 ENV FFMPEG_THREADS=4
 ENV FFMPEG_PRESET=ultrafast
 ENV FFMPEG_CRF=30
 
-# Optional: reduce LibreOffice cold start lag
 RUN mkdir -p /root/.config/libreoffice/4/user
 
 # ------------------------------------------------------------
-# 🪄 Prewarm essential tools (optional but improves first call latency)
+# 🪄 Prewarm essential tools
 # ------------------------------------------------------------
 RUN ffmpeg -version && \
     libreoffice --headless --version && \
@@ -63,7 +59,9 @@ RUN ffmpeg -version && \
 # 📦 Install Node.js dependencies
 # ------------------------------------------------------------
 COPY package*.json ./
-RUN npm ci --omit=dev
+
+# 👇 This line will safely handle both cases (with or without package-lock.json)
+RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --production; fi
 
 # ------------------------------------------------------------
 # 🧠 Copy app source
