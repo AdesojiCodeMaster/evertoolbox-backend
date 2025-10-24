@@ -1,55 +1,62 @@
-# -------------------------------
-# Node & System Files
-# -------------------------------
+# ------------------------------------------------------------
+# ⚡ EverToolbox Backend Dockerignore
+# Keeps your image small, clean, and secure
+# ------------------------------------------------------------
+
+# Node dependencies — they’re installed in Docker
 node_modules
 npm-debug.log
-yarn-debug.log
 yarn-error.log
-package-lock.json
-pnpm-lock.yaml
+package-lock.json.tmp
 
-# -------------------------------
-# Git & IDE Metadata
-# -------------------------------
+# Build and temporary files
+*.tmp
+*.log
+*.bak
+*.swp
+*.DS_Store
+*.pid
+*.seed
+*.tgz
+
+# Git & project metadata
 .git
 .gitignore
 .gitattributes
+.github
+
+# OS cache and editor files
 .vscode
 .idea
-.DS_Store
-Thumbs.db
+.cache
+*.sublime-project
+*.sublime-workspace
 
-# -------------------------------
-# OS & Temp Files
-# -------------------------------
+# Uploads and generated files
+uploads/
 tmp/
 temp/
-*.tmp
-*.log
+converted/
+output/
+test_files/
+*.zip
+*.tar
+*.gz
+*.7z
 
-# -------------------------------
-# Build Artifacts
-# -------------------------------
-dist/
-build/
-coverage/
-.cache/
-.env
-.env.*
-
-# -------------------------------
-# Local uploads / user files (if any)
-# -------------------------------
-uploads/
-public/uploads/
-assets/uploads/
-files/
-*.bak
-*.swp
-
-# -------------------------------
-# Render / Docker internal
-# -------------------------------
+# Docker build artifacts
 Dockerfile
-docker-compose.yml
-README.md
+.dockerignore
+
+# Local environment config
+.env
+.env.local
+.env.development
+.env.production
+.env.test
+
+# Optional: exclude frontend (if same repo)
+frontend/
+build/
+dist/
+public/
