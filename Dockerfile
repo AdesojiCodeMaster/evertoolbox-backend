@@ -1,5 +1,5 @@
 # ------------------------------------------------------------
-# ⚡ EverToolbox Backend Dockerfile (Render-Optimized & Compatible)
+# ⚡ EverToolbox Backend Dockerfile (Render-Optimized & Stable)
 # Faster conversions: tuned for ffmpeg, LibreOffice, ImageMagick
 # ------------------------------------------------------------
 
@@ -24,6 +24,7 @@ RUN apt-get update && \
       fonts-dejavu-core \
       fonts-freefont-ttf \
       fonts-liberation \
+      curl \
       && \
     \
     # ✅ Fix ImageMagick security policy for PDF & PS conversions
@@ -38,11 +39,15 @@ RUN apt-get update && \
 # ------------------------------------------------------------
 # ⚙️ Performance tuning
 # ------------------------------------------------------------
-ENV TMPDIR=/dev/shm
+# 🧠 Use /tmp instead of /dev/shm (Render gives /dev/shm only 64MB)
+ENV TMPDIR=/tmp
+
+# ⚡ Optimize ffmpeg performance
 ENV FFMPEG_THREADS=4
 ENV FFMPEG_PRESET=ultrafast
 ENV FFMPEG_CRF=30
 
+# 🗂️ Ensure LibreOffice user config folder exists
 RUN mkdir -p /root/.config/libreoffice/4/user
 
 # ------------------------------------------------------------
@@ -60,7 +65,7 @@ RUN ffmpeg -version && \
 # ------------------------------------------------------------
 COPY package*.json ./
 
-# 👇 This line will safely handle both cases (with or without package-lock.json)
+# 👇 This safely handles both cases (with or without package-lock.json)
 RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --production; fi
 
 # ------------------------------------------------------------
@@ -74,6 +79,12 @@ COPY . .
 EXPOSE 10000
 ENV PORT=10000
 ENV NODE_ENV=production
+
+# ------------------------------------------------------------
+# ❤️ Optional healthcheck for uptime monitoring
+# ------------------------------------------------------------
+HEALTHCHECK --interval=30s --timeout=5s \
+  CMD curl -f http://localhost:10000/health || exit 1
 
 # ------------------------------------------------------------
 # 🚀 Launch backend
