@@ -157,11 +157,25 @@ async function flattenImageWhite(input, out) {
   const magickCmd = await findMagickCmd();
   if (magickCmd) {
     // 🩵 FIX: stronger flatten flags to avoid dark backgrounds
-    const cmd = `${magickCmd} "${input}" -background white -alpha remove -flatten -colorspace sRGB "${out}"`;
+    // also add +repage to avoid canvas problems
+    const cmd = `${magickCmd} "${input}" -background white -alpha remove -flatten +repage -colorspace sRGB "${out}"`;
     await runCmd(cmd);
   } else {
     await fsp.copyFile(input, out);
   }
+}
+
+// ---------------- Helper: render PDF first page with Ghostscript ----------------
+async function renderPdfWithGs(inputPdf, outFile, format = "png", dpi = 200) {
+  // format: png or jpeg
+  const device = (format === "jpeg" || format === "jpg") ? "jpeg" : "png16m";
+  // build gs command; write single page (first) for speed
+  // -dFirstPage=1 -dLastPage=1 ensures single page
+  // Use -dTextAlphaBits=4 -dGraphicsAlphaBits=4 for quality
+  const gsCmd = `gs -dSAFER -dBATCH -dNOPAUSE -dFirstPage=1 -dLastPage=1 -sDEVICE=${device} -r${dpi} -dTextAlphaBits=4 -dGraphicsAlphaBits=4 -sOutputFile="${outFile}" "${inputPdf}"`;
+  console.log("📄 gs render:", gsCmd);
+  await runCmd(gsCmd);
+  return outFile;
 }
 
 // ---------------- Audio conversion ----------------
@@ -246,13 +260,13 @@ async function convertVideo(input, outPath, targetExt) {
   if (ext === "webm") {
     // 🩵 FIX: faster VP8 profile (realtime deadline / cpu-used) to speed WebM encoding
     // prefer VP8 for speed, fall back to VP9 or container copy if it fails
-    const vp8cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libvpx -b:v 1M -deadline realtime -cpu-used 6 -row-mt 1 -c:a libopus -b:a 96k -f webm "${out}"`;
+    const vp8cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libvpx -b:v 1M -deadline realtime -cpu-used 6 -row-mt 1 -threads ${FFMPEG_THREADS} -c:a libopus -b:a 96k -f webm "${out}"`;
     console.log("🎬 ffmpeg (video - try vp8 fast):", vp8cmd);
     try {
       await runCmd(vp8cmd);
     } catch (errVp8) {
       console.warn("VP8 quick path failed, falling back to VP9:", errVp8 && errVp8.message);
-      const tryVp9 = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libvpx-vp9 -b:v 1M -cpu-used 4 -row-mt 1 -deadline good -c:a libopus -b:a 96k -f webm "${out}"`;
+      const tryVp9 = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libvpx-vp9 -b:v 1M -cpu-used 4 -row-mt 1 -deadline good -threads ${FFMPEG_THREADS} -c:a libopus -b:a 96k -f webm "${out}"`;
       console.log("🎬 ffmpeg (video - try vp9):", tryVp9);
       try {
         await runCmd(tryVp9);
@@ -298,71 +312,107 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
   // Use ImageMagick + Ghostscript for PDF -> image conversions (works where poppler tools fail)
   const magickCmd = await findMagickCmd();
 
-  // ---------------- PDF -> images (single-page) using ImageMagick (no pdftoppm/pdftocairo)
+  // ---------------- PDF -> images (single-page) using Ghostscript -> fallback to ImageMagick
   if (inExt === "pdf" && ["png","jpg","jpeg","webp","tiff","bmp"].includes(ext)) {
-    if (!magickCmd) {
-      // If no ImageMagick, try pdftoppm fallback (older behavior)
-      const formatFallback = (ext === "jpg" || ext === "jpeg") ? "jpeg" : ext;
-      const prefix = path.join(tmpDir, safeOutputBase(path.parse(input).name));
-      const cmd = `pdftoppm -f 1 -singlefile -${formatFallback} "${input}" "${prefix}"`;
-      console.log("📄 pdftoppm fallback:", cmd);
-      await runCmd(cmd).catch(err => { throw new Error(`pdftoppm failed: ${err.message}`); });
-      const produced = `${prefix}.${formatFallback}`;
-      if (!fs.existsSync(produced)) {
-        const alt = `${prefix}-1.${formatFallback}`;
-        if (fs.existsSync(alt)) { await fsp.rename(alt, out); return out; }
-        throw new Error("pdftoppm did not produce page image");
-      }
-      // flatten to white
-      await flattenImageWhite(produced, out);
-      await safeCleanup(produced);
-      // honor requested casing for JPG/JPEG
-      if ((extRequested === "JPG" || extRequested === "jpg" || extRequested === "jpeg") && (formatFallback === "jpeg")) {
-        const desired = fixOutputExtension(out, extRequested);
-        if (desired !== out && fs.existsSync(out)) { await fsp.rename(out, desired).catch(()=>{}); return desired; }
-      }
-      return out;
-    }
+    // choose a safe target format (avoid producing TIFF if possible since it caused write errors)
+    const preferredFormat = (ext === "tiff" || ext === "bmp") ? "png" : (ext === "jpg" ? "jpeg" : ext);
+    const tmpPrefix = path.join(tmpDir, safeOutputBase(path.parse(input).name));
+    const tmpProduced = fixOutputExtension(`${tmpPrefix}`, extRequested || preferredFormat);
 
-    // ImageMagick path (preferred): render first page to requested image
-    // use density 200 for good quality, flatten to white to avoid dark bg
-    // use input.pdf[0] to get first page only
-    const density = 200;
-    const quality = 90;
-    const pageSpec = `${input}[0]`;
-    // produce temporary file with requested casing
-    const tmpOut = fixOutputExtension(path.join(tmpDir, safeOutputBase(path.parse(input).name)), extRequested || ext);
-    // build command depending on magickCmd ('magick' vs 'convert')
-    // For ImageMagick v7 'magick' prefix is used, for v6 'convert' is used.
-    const imgCmd = `${magickCmd} -density ${density} "${pageSpec}" -quality ${quality} -background white -alpha remove -flatten -colorspace sRGB "${tmpOut}"`;
-    console.log("📄 ImageMagick PDF->image:", imgCmd);
-    await runCmd(imgCmd).catch(err => { throw new Error(`ImageMagick PDF->image failed: ${err.message}`); });
-
-    // ensure produced exists
-    if (!fs.existsSync(tmpOut)) {
-      // try common alternate produced names (ImageMagick sometimes appends page numbers)
-      const alt = fixOutputExtension(tmpOut.replace(/\.\w+$/, '' ) + '-0', extRequested || ext);
-      if (fs.existsSync(alt)) {
-        await fsp.rename(alt, out).catch(()=>{});
+    // First attempt: Ghostscript rendering (more reliable and with controlled memory)
+    try {
+      const gsFormat = (preferredFormat === "jpeg") ? "jpeg" : "png";
+      // choose dpi lower if memory issues happen; default 150-200 for good balance
+      const dpi = 200;
+      const gsOut = tmpProduced; // includes extension
+      await renderPdfWithGs(input, gsOut, gsFormat, dpi);
+      if (!fs.existsSync(gsOut)) throw new Error("Ghostscript did not produce output");
+      // If requested webp, convert the produced png/jpeg to webp if ImageMagick available
+      if (ext === "webp" && magickCmd) {
+        const tmpWebp = fixOutputExtension(`${tmpPrefix}`, "webp");
+        await runCmd(`${magickCmd} "${gsOut}" "${tmpWebp}"`).catch(err => { throw new Error(`imagemagick failed: ${err.message}`); });
+        await safeCleanup(gsOut);
+        await flattenImageWhite(tmpWebp, out);
+        await safeCleanup(tmpWebp);
         return out;
       }
-      throw new Error("ImageMagick failed to produce PDF page image");
-    }
+      // flatten to white into final out path
+      await flattenImageWhite(gsOut, out);
+      await safeCleanup(gsOut);
 
-    // final flatten again to ensure white background and move to desired out path
-    await flattenImageWhite(tmpOut, out);
-    await safeCleanup(tmpOut);
+      // honor requested casing for JPG/JPEG
+      if ((ext === "jpeg" || ext === "jpg") && extRequested && extRequested !== preferredFormat) {
+        const desired = fixOutputExtension(out, extRequested);
+        if (desired !== out && fs.existsSync(out)) {
+          await fsp.rename(out, desired).catch(()=>{});
+          return desired;
+        }
+      }
 
-    // honor requested casing for JPG/JPEG (user may request 'JPG' uppercase)
-    if ((ext === "jpeg" || ext === "jpg") && extRequested && extRequested !== ext) {
-      const desired = fixOutputExtension(out, extRequested);
-      if (desired !== out && fs.existsSync(out)) {
-        await fsp.rename(out, desired).catch(()=>{});
-        return desired;
+      return out;
+    } catch (gsErr) {
+      console.warn("Ghostscript render failed, falling back to ImageMagick/pdftoppm:", gsErr && gsErr.message);
+      // attempt ImageMagick path next
+      try {
+        if (!magickCmd) {
+          // If no ImageMagick, try pdftoppm fallback (older behavior)
+          const formatFallback = (preferredFormat === "jpeg") ? "jpeg" : preferredFormat;
+          const prefix = path.join(tmpDir, safeOutputBase(path.parse(input).name));
+          const cmd = `pdftoppm -f 1 -singlefile -${formatFallback} "${input}" "${prefix}"`;
+          console.log("📄 pdftoppm fallback:", cmd);
+          await runCmd(cmd).catch(err => { throw new Error(`pdftoppm failed: ${err.message}`); });
+          const produced = `${prefix}.${formatFallback}`;
+          if (!fs.existsSync(produced)) {
+            const alt = `${prefix}-1.${formatFallback}`;
+            if (fs.existsSync(alt)) { await fsp.rename(alt, out); return out; }
+            throw new Error("pdftoppm did not produce page image");
+          }
+          // flatten to white
+          await flattenImageWhite(produced, out);
+          await safeCleanup(produced);
+          // honor requested casing for JPG/JPEG
+          if ((extRequested === "JPG" || extRequested === "jpg" || extRequested === "jpeg") && (formatFallback === "jpeg")) {
+            const desired = fixOutputExtension(out, extRequested);
+            if (desired !== out && fs.existsSync(out)) { await fsp.rename(out, desired).catch(()=>{}); return desired; }
+          }
+          return out;
+        }
+
+        // ImageMagick path (preferred when gs fails)
+        const density = 150; // slightly lower to avoid heavy memory use
+        const quality = 90;
+        const pageSpec = `${input}[0]`;
+        const tmpOut = fixOutputExtension(path.join(tmpDir, safeOutputBase(path.parse(input).name)), extRequested || preferredFormat);
+        const imgCmd = `${magickCmd} -density ${density} "${pageSpec}" -quality ${quality} -background white -alpha remove -flatten +repage -colorspace sRGB "${tmpOut}"`;
+        console.log("📄 ImageMagick PDF->image:", imgCmd);
+        await runCmd(imgCmd).catch(err => { throw new Error(`ImageMagick PDF->image failed: ${err.message}`); });
+
+        if (!fs.existsSync(tmpOut)) {
+          const alt = fixOutputExtension(tmpOut.replace(/\.\w+$/, '' ) + '-0', extRequested || preferredFormat);
+          if (fs.existsSync(alt)) {
+            await fsp.rename(alt, out).catch(()=>{});
+            return out;
+          }
+          throw new Error("ImageMagick failed to produce PDF page image");
+        }
+
+        // final flatten again to ensure white background and move to desired out path
+        await flattenImageWhite(tmpOut, out);
+        await safeCleanup(tmpOut);
+
+        if ((ext === "jpeg" || ext === "jpg") && extRequested && extRequested !== preferredFormat) {
+          const desired = fixOutputExtension(out, extRequested);
+          if (desired !== out && fs.existsSync(out)) {
+            await fsp.rename(out, desired).catch(()=>{});
+            return desired;
+          }
+        }
+
+        return out;
+      } catch (fallbackErr) {
+        throw new Error(`PDF->image failed: ${fallbackErr && fallbackErr.message}`);
       }
     }
-
-    return out;
   }
 
   // ---------------- PDF -> text / md using pdftotext (no rasterization)
