@@ -36,7 +36,7 @@ RUN apt-get update && \
 ENV TMPDIR=/dev/shm
 
 # Force ffmpeg to use multiple threads
-ENV FFMPEG_THREADS=2
+ENV FFMPEG_THREADS=4
 
 # Optional: reduce LibreOffice cold start lag
 RUN mkdir -p /root/.config/libreoffice/4/user
