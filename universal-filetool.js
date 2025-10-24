@@ -1,6 +1,8 @@
-// universal-filetool.js (FINAL - fully integrated, naked downloads only)
-// Requirements in runtime image: ffmpeg, libreoffice, poppler-utils (pdftoppm/pdftotext), ghostscript (gs),
-// imagemagick (magick or convert), pandoc (optional). No zip fallback. Uses /dev/shm when present.
+// universal-filetool.js — Option A Hybrid (production-ready)
+// Hybrid temp strategy: try /dev/shm first (fast), fallback to /tmp (stable).
+// Requirements: ffmpeg, libreoffice, poppler-utils (pdftoppm/pdftotext), ghostscript (gs),
+// imagemagick (magick or convert), pandoc (optional).
+// Keeps AAC logic unchanged.
 
 const express = require("express");
 const multer = require("multer");
@@ -17,19 +19,21 @@ const mime = require("mime-types");
 const pipe = promisify(pipeline);
 const router = express.Router();
 
-const TMP_DIR = process.env.TMPDIR || (fs.existsSync("/dev/shm") ? "/dev/shm" : os.tmpdir());
-const FFMPEG_THREADS = String(process.env.FFMPEG_THREADS || "2");
+const SHM = "/dev/shm";
+const TMP = process.env.TMPDIR || os.tmpdir();
+const TRY_DIRS = (fs.existsSync(SHM) ? [SHM, TMP] : [TMP]); // hybrid: try shm then tmp
+const FFMPEG_THREADS = process.env.FFMPEG_THREADS || "2";
 const STABLE_CHECK_MS = 200;
 const STABLE_CHECK_ROUNDS = 3;
-const STABLE_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes for large conversions
+const STABLE_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
 
-// ---------------- Multer upload ----------------
+// ---------------- Multer ----------------
 const upload = multer({
   storage: multer.diskStorage({
-    destination: (req, file, cb) => cb(null, TMP_DIR),
+    destination: (req, file, cb) => cb(null, TMP),
     filename: (req, file, cb) => cb(null, `${Date.now()}-${uuidv4()}-${file.originalname.replace(/\s+/g, "_")}`)
   }),
-  limits: { fileSize: 1024 * 1024 * 1024 } // 1 GB
+  limits: { fileSize: 1024 * 1024 * 1024 } // 1GB
 }).single("file");
 
 // ---------------- Exec wrapper ----------------
@@ -89,12 +93,10 @@ async function safeCleanup(filePath) {
       console.log("🧹 Temp deleted:", filePath);
     }
   } catch (e) {
-    // suppress ENOENT and log others
     if (e && e.code !== "ENOENT") console.warn("cleanup failed:", e && e.message);
   }
 }
 
-// Wait until file exists and its size is stable for STABLE_CHECK_ROUNDS
 async function waitForStableFileSize(filePath, timeoutMs = STABLE_TIMEOUT_MS) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -147,232 +149,265 @@ const docExts = new Set(["pdf","txt","md","html"]);
 
 // ---------------- Helper: flatten image to white ----------------
 async function flattenImageWhite(input, out) {
-  if (await hasCmd("magick")) {
-    const cmd = `magick "${input}" -background white -alpha remove -alpha off "${out}"`;
+  const magick = await findMagickCmd();
+  if (magick) {
+    const cmd = `${magick} "${input}" -background white -alpha remove -alpha off "${out}"`;
     await runCmd(cmd);
   } else {
     await fsp.copyFile(input, out);
   }
 }
 
+// ---------------- Core: attempt operation in try dirs (hybrid) ----------------
+async function tryInDirs(fnFactory) {
+  let lastErr = null;
+  for (const base of TRY_DIRS) {
+    const workDir = path.join(base, `evertoolbox-${Date.now()}-${uuidv4()}`);
+    try {
+      await fsp.mkdir(workDir, { recursive: true });
+      try {
+        const result = await fnFactory(workDir);
+        return { result, workDir };
+      } catch (err) {
+        lastErr = err;
+        // clean workDir and continue to next
+        try { await fsp.rmdir(workDir, { recursive: true }); } catch {}
+        continue;
+      }
+    } catch (e) {
+      lastErr = e;
+      continue;
+    }
+  }
+  throw lastErr || new Error("All temp dirs failed");
+}
+
 // ---------------- Audio conversion ----------------
-async function convertAudio(input, outPath, targetExt) {
-  if (!fs.existsSync(input)) throw new Error("Input file not found");
-  const ext = (targetExt || path.extname(outPath)).toString().replace(/^\./, "").toLowerCase();
+async function convertAudioAtTmp(input, outBase, targetExt, tmpDir) {
+  if (!fs.existsSync(input)) throw new Error("Input missing");
+  const ext = (targetExt || path.extname(outBase)).toString().replace(/^\./, "").toLowerCase();
   if (!ext) throw new Error("No target audio extension specified");
 
-  let out = fixOutputExtension(outPath, ext);
-  if (!path.extname(out)) out = `${out}.${ext}`;
-
-  let cmd;
+  let out = path.join(tmpDir, `${path.parse(outBase).name}.${ext}`);
+  // special-handling for types that need explicit container naming
   switch (ext) {
     case "wav":
-      cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -acodec pcm_s16le -ar 44100 "${out}"`;
+      await runCmd(`ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -acodec pcm_s16le -ar 44100 "${out}"`);
       break;
     case "mp3":
-      cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -codec:a libmp3lame -qscale:a 2 "${out}"`;
+      await runCmd(`ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -codec:a libmp3lame -qscale:a 2 "${out}"`);
       break;
     case "ogg":
-      cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:a libvorbis -q:a 4 "${out}"`;
+      await runCmd(`ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:a libvorbis -q:a 4 "${out}"`);
       break;
     case "opus":
-      out = fixOutputExtension(out, "opus");
-      cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -map 0:a -c:a libopus -b:a 96k -vn -f opus "${out}"`;
+      out = path.join(tmpDir, `${path.parse(outBase).name}.opus`);
+      await runCmd(`ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -map 0:a -c:a libopus -b:a 96k -vn -f opus "${out}"`);
       break;
     case "aac":
-      out = fixOutputExtension(out, "aac");
-      // raw ADTS AAC stream
-      cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -map 0:a -c:a aac -b:a 128k -f adts "${out}"`;
+      out = path.join(tmpDir, `${path.parse(outBase).name}.aac`);
+      await runCmd(`ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -map 0:a -c:a aac -b:a 128k -f adts "${out}"`);
       break;
     case "m4a":
-      out = fixOutputExtension(out, "m4a");
-      cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -map 0:a -c:a aac -b:a 128k "${out}"`;
+      out = path.join(tmpDir, `${path.parse(outBase).name}.m4a`);
+      await runCmd(`ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -map 0:a -c:a aac -b:a 128k "${out}"`);
       break;
     case "flac":
-      cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -map 0:a -c:a flac "${out}"`;
+      out = path.join(tmpDir, `${path.parse(outBase).name}.flac`);
+      await runCmd(`ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -map 0:a -c:a flac "${out}"`);
       break;
     case "webm":
-      out = fixOutputExtension(out, "webm");
-      cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -map 0:a -vn -c:a libopus -b:a 96k -f webm "${out}"`;
+      out = path.join(tmpDir, `${path.parse(outBase).name}.webm`);
+      await runCmd(`ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -map 0:a -vn -c:a libopus -b:a 96k -f webm "${out}"`);
       break;
     default:
       throw new Error(`Unsupported target audio format: ${ext}`);
   }
 
-  console.log("🎬 ffmpeg (audio):", cmd);
-  await runCmd(cmd).catch(err => { throw new Error(err.message); });
-
   if (!fs.existsSync(out)) throw new Error("Audio conversion failed: output missing");
-  if (!(await waitForStableFileSize(out))) throw new Error("Audio conversion failed: output unstable or empty");
-
-  return await ensureProperExtension(out, ext);
+  if (!(await waitForStableFileSize(out))) throw new Error("Audio conversion failed: unstable output");
+  return out;
 }
 
 // ---------------- Video conversion ----------------
-async function convertVideo(input, outPath, targetExt) {
-  if (!fs.existsSync(input)) throw new Error("Input file not found");
-  const ext = (targetExt || path.extname(outPath)).toString().replace(/^\./, "").toLowerCase();
+async function convertVideoAtTmp(input, outBase, targetExt, tmpDir) {
+  if (!fs.existsSync(input)) throw new Error("Input missing");
+  const ext = (targetExt || path.extname(outBase)).toString().replace(/^\./, "").toLowerCase();
   if (!ext) throw new Error("No target video extension specified");
 
-  let out = fixOutputExtension(outPath, ext);
-  if (!path.extname(out)) out = `${out}.${ext}`;
-
-  let cmd;
+  const out = path.join(tmpDir, `${path.parse(outBase).name}.${ext}`);
 
   if (ext === "webm") {
-    // prefer VP9 for quality but try VP9 then fallback to VP8 if it fails.
-    const tryVp9 = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libvpx-vp9 -b:v 1M -cpu-used 4 -row-mt 1 -c:a libopus -b:a 96k -f webm "${out}"`;
-    console.log("🎬 ffmpeg (video - try vp9):", tryVp9);
+    // prefer VP9; fallback to VP8 if VP9 fails
+    const vp9 = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libvpx-vp9 -b:v 1M -cpu-used 4 -row-mt 1 -c:a libopus -b:a 96k -f webm "${out}"`;
     try {
-      await runCmd(tryVp9);
-    } catch (errVp9) {
-      console.warn("VP9 failed, falling back to VP8:", errVp9 && errVp9.message);
-      const fallbackVp8 = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libvpx -b:v 1M -cpu-used 5 -row-mt 1 -c:a libopus -b:a 96k -f webm "${out}"`;
-      console.log("🎬 ffmpeg (video - fallback vp8):", fallbackVp8);
-      await runCmd(fallbackVp8).catch(err => { throw new Error(err.message); });
+      await runCmd(vp9);
+    } catch (e) {
+      console.warn("VP9 failed, fallback to VP8:", e && e.message);
+      const vp8 = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libvpx -b:v 1M -cpu-used 5 -row-mt 1 -c:a libopus -b:a 96k -f webm "${out}"`;
+      await runCmd(vp8);
     }
   } else if (ext === "mkv") {
-    cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libx264 -preset ultrafast -crf 28 -c:a aac -b:a 96k "${out}"`;
-    console.log("🎬 ffmpeg (video):", cmd);
-    await runCmd(cmd).catch(err => { throw new Error(err.message); });
+    await runCmd(`ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libx264 -preset ultrafast -crf 28 -c:a aac -b:a 96k "${out}"`);
   } else if (["mp4","mov","m4v","avi"].includes(ext)) {
-    cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libx264 -preset fast -crf 28 -c:a aac -b:a 128k "${out}"`;
-    console.log("🎬 ffmpeg (video):", cmd);
-    await runCmd(cmd).catch(err => { throw new Error(err.message); });
+    await runCmd(`ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libx264 -preset fast -crf 28 -c:a aac -b:a 128k "${out}"`);
   } else {
     // container-only copy
-    cmd = `ffmpeg -y -i "${input}" -c copy "${out}"`;
-    console.log("🎬 ffmpeg (container copy):", cmd);
-    await runCmd(cmd).catch(err => { throw new Error(err.message); });
+    await runCmd(`ffmpeg -y -i "${input}" -c copy "${out}"`);
   }
 
   if (!fs.existsSync(out)) throw new Error("Video conversion failed: output missing");
-  if (!(await waitForStableFileSize(out))) throw new Error("Video conversion failed: output unstable or empty");
-
+  if (!(await waitForStableFileSize(out))) throw new Error("Video conversion failed: unstable output");
   return await ensureProperExtension(out, ext);
 }
 
 // ---------------- Document conversion ----------------
-async function convertDocument(input, outPath, targetExt, tmpDir) {
-  if (!fs.existsSync(input)) throw new Error("Input file not found");
+async function convertDocumentAtTmp(input, outBase, targetExt, tmpDir) {
+  if (!fs.existsSync(input)) throw new Error("Input missing");
   const inExt = extOfFilename(input) || extOfFilename(path.basename(input));
-  const ext = (targetExt || path.extname(outPath)).toString().replace(/^\./, "").toLowerCase();
-  const out = fixOutputExtension(outPath, ext);
-  tmpDir = tmpDir || path.dirname(input);
+  const ext = (targetExt || path.extname(outBase)).toString().replace(/^\./, "").toLowerCase();
+  const out = path.join(tmpDir, `${path.parse(outBase).name}.${ext}`);
 
-  // PDF -> images (single-page)
+  // PDF -> images (single page) via pdftoppm
   if (inExt === "pdf" && ["png","jpg","jpeg","webp"].includes(ext)) {
     const format = (ext === "jpg" || ext === "jpeg") ? "jpeg" : ext;
-    const prefix = path.join(tmpDir, safeOutputBase(path.parse(input).name));
+    const prefix = path.join(tmpDir, path.parse(outBase).name);
     const cmd = `pdftoppm -f 1 -singlefile -${format} "${input}" "${prefix}"`;
-    console.log("📄 pdftoppm:", cmd);
     await runCmd(cmd).catch(err => { throw new Error(`pdftoppm failed: ${err.message}`); });
     const produced = `${prefix}.${format}`;
     if (!fs.existsSync(produced)) {
+      // try alternative names (pdftoppm sometimes produces -1)
       const alt = `${prefix}-1.${format}`;
-      if (fs.existsSync(alt)) { await fsp.rename(alt, out); return out; }
+      if (fs.existsSync(alt)) {
+        await fsp.rename(alt, out);
+        return out;
+      }
       throw new Error("pdftoppm did not produce page image");
     }
+    // flatten to white to avoid dark background issue
     await flattenImageWhite(produced, out);
     await safeCleanup(produced);
+    if (!(await waitForStableFileSize(out))) throw new Error("PDF->image output unstable");
     return out;
   }
 
-  // PDF -> text / md
+  // PDF -> text/md
   if (inExt === "pdf" && ["txt","md"].includes(ext)) {
     if (await hasCmd("pdftotext")) {
-      const mid = path.join(tmpDir, `${safeOutputBase(path.parse(input).name)}.txt`);
+      const mid = path.join(tmpDir, `${path.parse(outBase).name}.txt`);
       await runCmd(`pdftotext "${input}" "${mid}"`).catch(err => { throw new Error(`pdftotext failed: ${err.message}`); });
-      if (ext === "md" && await hasCmd("pandoc")) { await runCmd(`pandoc "${mid}" -o "${out}"`).catch(err => { throw new Error(`pandoc failed: ${err.message}`); }); await safeCleanup(mid); return out; }
-      await fsp.rename(mid, out); return out;
-    } else throw new Error("pdftotext not available for PDF->text conversion");
+      if (ext === "md" && await hasCmd("pandoc")) {
+        await runCmd(`pandoc "${mid}" -o "${out}"`).catch(err => { throw new Error(`pandoc failed: ${err.message}`); });
+        await safeCleanup(mid);
+        return out;
+      }
+      await fsp.rename(mid, out);
+      return out;
+    } else throw new Error("pdftotext not available");
   }
 
   // PDF -> docx via pdftotext + pandoc (best-effort)
   if (inExt === "pdf" && ext === "docx") {
     if (await hasCmd("pdftotext") && await hasCmd("pandoc")) {
-      const mid = path.join(tmpDir, `${safeOutputBase(path.parse(input).name)}.txt`);
+      const mid = path.join(tmpDir, `${path.parse(outBase).name}.txt`);
       await runCmd(`pdftotext "${input}" "${mid}"`);
       await runCmd(`pandoc "${mid}" -o "${out}"`);
       await safeCleanup(mid);
+      if (!(await waitForStableFileSize(out))) throw new Error("PDF->docx unstable");
       return out;
     }
   }
 
-  // Office conversions via LibreOffice
+  // LibreOffice fallback for office & pdf
   if (officeExts.has(inExt) || officeExts.has(ext) || inExt === "pdf") {
     const cmd = `libreoffice --headless --invisible --nologo --nodefault --nolockcheck --convert-to ${ext} "${input}" --outdir "${tmpDir}"`;
-    console.log("📄 libreoffice:", cmd);
     await runCmd(cmd).catch(err => { throw new Error(`LibreOffice conversion failed: ${err.message}`); });
     const gen = path.join(tmpDir, `${path.parse(input).name}.${ext}`);
-    if (!fs.existsSync(gen)) throw new Error(`LibreOffice failed to produce ${ext}`);
-    // flatten produced images to avoid dark backgrounds
-    if (["png","jpg","jpeg","webp"].includes(ext)) await flattenImageWhite(gen, gen);
-    await fsp.rename(gen, out).catch(()=>{});
-    if (!(await waitForStableFileSize(out))) throw new Error("Document conversion failed: output unstable or empty");
+    if (!fs.existsSync(gen)) {
+      // sometimes libreoffice may create different suffixes; try to find any file with same basename+ext
+      const files = await fsp.readdir(tmpDir);
+      const candidate = files.find(f => f.startsWith(path.parse(input).name) && f.endsWith(`.${ext}`));
+      if (candidate) {
+        await fsp.rename(path.join(tmpDir, candidate), out);
+      } else {
+        throw new Error(`LibreOffice failed to produce ${ext}`);
+      }
+    } else {
+      await fsp.rename(gen, out);
+    }
+    // flatten images
+    if (["png","jpg","jpeg","webp"].includes(ext)) await flattenImageWhite(out, out);
+    if (!(await waitForStableFileSize(out))) throw new Error("LibreOffice output unstable");
     return out;
   }
 
   throw new Error(`Unsupported document conversion: ${inExt} -> ${ext}`);
 }
 
-// ---------------- Compression (heavy) - overwrite same extension ----------------
-async function compressFile(input, outPath, inputExt) {
-  if (!fs.existsSync(input)) throw new Error("Input file not found");
+// ---------------- Compression (heavy) ----------------
+async function compressAtTmp(input, outBase, inputExt, tmpDir) {
+  if (!fs.existsSync(input)) throw new Error("Input missing");
   inputExt = (inputExt || extOfFilename(input)).replace(/^\./, "").toLowerCase();
-  const out = fixOutputExtension(outPath, inputExt);
+  const out = path.join(tmpDir, `${path.parse(outBase).name}.${inputExt}`);
 
   let cmd;
   if (inputExt === "pdf") {
     cmd = `gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/screen -dNOPAUSE -dQUIET -dBATCH -sOutputFile="${out}" "${input}"`;
-  } else if (imageExts.has(inputExt) || ["jpg","jpeg","png","webp"].includes(inputExt)) {
+    await runCmd(cmd);
+  } else if (imageExts.has(inputExt)) {
+    const magick = await findMagickCmd();
     if (["jpg","jpeg"].includes(inputExt)) {
-      cmd = `magick "${input}" -strip -sampling-factor 4:2:0 -quality 55 -interlace Plane -colorspace sRGB "${out}"`;
+      if (!magick) throw new Error("imagemagick required for image compression");
+      cmd = `${magick} "${input}" -strip -sampling-factor 4:2:0 -quality 55 -interlace Plane -colorspace sRGB "${out}"`;
+      await runCmd(cmd);
     } else if (inputExt === "png") {
       if (await hasCmd("pngquant")) {
-        cmd = `pngquant --quality=50-80 --output "${out}" --force "${input}"`;
-      } else {
-        cmd = `magick "${input}" -strip -quality 60 "${out}"`;
-      }
+        await runCmd(`pngquant --quality=50-80 --output "${out}" --force "${input}"`);
+      } else if (magick) {
+        await runCmd(`${magick} "${input}" -strip -quality 60 "${out}"`);
+      } else throw new Error("png compression requires imagemagick or pngquant");
     } else {
-      cmd = `magick "${input}" -strip -quality 60 "${out}"`;
+      const m = magick;
+      if (!m) throw new Error("imagemagick required for image compression");
+      await runCmd(`${m} "${input}" -strip -quality 60 "${out}"`);
     }
   } else if (audioExts.has(inputExt)) {
-    cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -ac 2 -ar 44100 -b:a 96k "${out}"`;
+    await runCmd(`ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -ac 2 -ar 44100 -b:a 96k "${out}"`);
   } else if (videoExts.has(inputExt)) {
     if (inputExt === "webm") {
-      cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libvpx -b:v 600k -cpu-used 5 -row-mt 1 -c:a libopus -b:a 64k -f webm "${out}"`;
+      await runCmd(`ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libvpx -b:v 600k -cpu-used 5 -row-mt 1 -c:a libopus -b:a 64k -f webm "${out}"`);
     } else {
-      cmd = `ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libx264 -preset veryfast -crf 35 -c:a aac -b:a 96k "${out}"`;
+      await runCmd(`ffmpeg -y -threads ${FFMPEG_THREADS} -i "${input}" -c:v libx264 -preset veryfast -crf 35 -c:a aac -b:a 96k "${out}"`);
     }
   } else if (officeExts.has(inputExt) || docExts.has(inputExt)) {
-    // convert to PDF then compress -> return compressed PDF (naked file)
-    const tmpPdf = fixOutputExtension(outPath, "pdf");
-    if (await hasCmd("pandoc") && docExts.has(inputExt)) {
-      await runCmd(`pandoc "${input}" -o "${tmpPdf}"`).catch(()=>{});
-    } else {
-      await runCmd(`libreoffice --headless --invisible --nologo --nodefault --nolockcheck --convert-to pdf "${input}" --outdir "${path.dirname(tmpPdf)}"`).catch(()=>{});
+    // convert to PDF then compress (best-effort)
+    const tmpPdf = path.join(tmpDir, `${path.parse(outBase).name}.pdf`);
+    try {
+      if (docExts.has(inputExt) && await hasCmd("pandoc")) {
+        await runCmd(`pandoc "${input}" -o "${tmpPdf}"`);
+      } else {
+        await runCmd(`libreoffice --headless --invisible --nologo --nodefault --nolockcheck --convert-to pdf "${input}" --outdir "${tmpDir}"`);
+        // find produced pdf
+        const gen = path.join(tmpDir, `${path.parse(input).name}.pdf`);
+        if (fs.existsSync(gen)) await fsp.rename(gen, tmpPdf);
+      }
+      await runCmd(`gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/screen -dNOPAUSE -dQUIET -dBATCH -sOutputFile="${tmpPdf}" "${tmpPdf}"`);
+    } catch (e) {
+      throw new Error(`Document compression failed: ${e && e.message}`);
     }
-    await runCmd(`gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/screen -dNOPAUSE -dQUIET -dBATCH -sOutputFile="${tmpPdf}" "${tmpPdf}"`).catch(()=>{});
     if (!fs.existsSync(tmpPdf)) throw new Error("Document compression failed");
-    if (!(await waitForStableFileSize(tmpPdf))) throw new Error("Document compression produced unstable output");
     return tmpPdf;
   } else {
     throw new Error(`Compression not supported for .${inputExt}`);
   }
 
-  console.log("🗜️ compress cmd:", cmd);
-  await runCmd(cmd).catch(err => { throw new Error(`Compression failed: ${err.message}`); });
-
   if (!fs.existsSync(out)) throw new Error("Compression failed: output missing");
-  if (!(await waitForStableFileSize(out))) throw new Error("Compression failed: output unstable or empty");
-
-  return await ensureProperExtension(out, inputExt);
+  if (!(await waitForStableFileSize(out))) throw new Error("Compression failed: unstable output");
+  return out;
 }
 
-// ---------------- Route: POST '/' ----------------
+// ---------------- Route ----------------
 router.post("/", (req, res) => {
-  // disable default timeouts for long conversions
   try { req.setTimeout(0); } catch (e) {}
   try { res.setTimeout(0); } catch (e) {}
 
@@ -385,66 +420,87 @@ router.post("/", (req, res) => {
     const inputPath = req.file.path;
     const originalName = sanitizeFilename(req.file.originalname);
     const inputExt = extOfFilename(originalName) || extOfFilename(inputPath);
-    const tmpDir = path.dirname(inputPath);
+    const outBaseName = safeOutputBase(originalName);
+    let producedPath = null;
+    let usedWorkDir = null;
 
-    const magickCmd = await findMagickCmd();
-    const baseOut = path.join(TMP_DIR, safeOutputBase(originalName));
-    const effectiveTarget = requestedTarget || inputExt;
-    const outPath = fixOutputExtension(baseOut, effectiveTarget);
-
-    let producedPath;
+    // guard: disallow same-format conversion when convert mode and explicit target provided
+    if (mode === "convert" && requestedTarget && requestedTarget === inputExt) {
+      await safeCleanup(inputPath);
+      return res.status(400).json({ error: `Conversion disallowed: source and target formats are identical (.${inputExt})` });
+    }
 
     try {
-      // Guard: identical source and target format => disallow
-      if (mode === "convert" && requestedTarget && requestedTarget === inputExt) {
-        await safeCleanup(inputPath);
-        return res.status(400).json({ error: `Conversion disallowed: source and target formats are identical (.${inputExt})` });
-      }
-
       if (mode === "compress") {
-        producedPath = await compressFile(inputPath, outPath, inputExt);
-      } else { // convert
-        if (audioExts.has(inputExt) || audioExts.has(effectiveTarget)) {
-          producedPath = await convertAudio(inputPath, outPath, effectiveTarget);
-        } else if (videoExts.has(inputExt) || videoExts.has(effectiveTarget)) {
-          producedPath = await convertVideo(inputPath, outPath, effectiveTarget);
-        } else if (inputExt === "pdf" || docExts.has(inputExt) || docExts.has(effectiveTarget) || officeExts.has(effectiveTarget)) {
-          producedPath = await convertDocument(inputPath, outPath, effectiveTarget, tmpDir);
-        } else if (imageExts.has(inputExt) || imageExts.has(effectiveTarget)) {
-          if (!magickCmd) throw new Error("ImageMagick not available");
-          const cmd = `${magickCmd} "${inputPath}" "${outPath}"`;
-          console.log("🖼️ imagemagick:", cmd);
-          await runCmd(cmd);
-          producedPath = await ensureProperExtension(outPath, effectiveTarget);
-          // flatten to white to avoid dark background artifacts
-          if (["png","jpg","jpeg","webp"].includes(extOfFilename(producedPath))) {
-            const tmpFlat = fixOutputExtension(producedPath, `flat.${extOfFilename(producedPath)}`);
-            await flattenImageWhite(producedPath, tmpFlat);
-            await fsp.rename(tmpFlat, producedPath).catch(()=>{});
-          }
+        // compress: attempt in hybrid dirs
+        const { result, workDir } = await tryInDirs(async (workDir) => {
+          const outPath = path.join(workDir, `${outBaseName}.${inputExt}`);
+          return await compressAtTmp(inputPath, outBaseName, inputExt, workDir);
+        });
+        producedPath = result;
+        usedWorkDir = workDir;
+      } else {
+        // convert mode: pick converter based on input/target types
+        // prefer target if provided; else preserve type (normalization)
+        const effectiveTarget = requestedTarget || inputExt;
+
+        // choose converter type: audio if either input or target is audio; video if either is video; doc if pdf/office
+        const isAudio = audioExts.has(inputExt) || audioExts.has(effectiveTarget);
+        const isVideo = videoExts.has(inputExt) || videoExts.has(effectiveTarget);
+        const isDoc = docExts.has(inputExt) || docExts.has(effectiveTarget) || officeExts.has(effectiveTarget);
+        const isImage = imageExts.has(inputExt) || imageExts.has(effectiveTarget);
+
+        if (isAudio && !isVideo && !isDoc && !isImage) {
+          const { result, workDir } = await tryInDirs(async (workDir) => {
+            return await convertAudioAtTmp(inputPath, outBaseName, effectiveTarget, workDir);
+          });
+          producedPath = result; usedWorkDir = workDir;
+        } else if (isVideo && !isAudio && !isDoc) {
+          const { result, workDir } = await tryInDirs(async (workDir) => {
+            return await convertVideoAtTmp(inputPath, outBaseName, effectiveTarget, workDir);
+          });
+          producedPath = result; usedWorkDir = workDir;
+        } else if (isDoc) {
+          const { result, workDir } = await tryInDirs(async (workDir) => {
+            return await convertDocumentAtTmp(inputPath, outBaseName, effectiveTarget, workDir);
+          });
+          producedPath = result; usedWorkDir = workDir;
+        } else if (isImage) {
+          const magick = await findMagickCmd();
+          if (!magick) throw new Error("ImageMagick not available for image conversion");
+          const { result, workDir } = await tryInDirs(async (workDir) => {
+            const out = path.join(workDir, `${outBaseName}.${effectiveTarget || inputExt}`);
+            const cmd = `${magick} "${inputPath}" "${out}"`;
+            await runCmd(cmd);
+            // flatten to white to avoid dark background
+            if (["png","jpg","jpeg","webp"].includes(extOfFilename(out))) {
+              const tmpFlat = path.join(workDir, `${outBaseName}.flat.${extOfFilename(out)}`);
+              await flattenImageWhite(out, tmpFlat);
+              await fsp.rename(tmpFlat, out).catch(()=>{});
+            }
+            if (!fs.existsSync(out)) throw new Error("Image convert failed");
+            if (!(await waitForStableFileSize(out))) throw new Error("Image output unstable");
+            return out;
+          });
+          producedPath = result; usedWorkDir = workDir;
         } else {
           throw new Error(`Unsupported file type: .${inputExt}`);
         }
       }
 
-      // Validate produced file
       if (!producedPath || !fs.existsSync(producedPath)) throw new Error("Output not produced.");
-      if (!(await waitForStableFileSize(producedPath))) throw new Error("Produced file is empty or unstable.");
+      if (!(await waitForStableFileSize(producedPath))) throw new Error("Produced file unstable or empty.");
 
-      // Ensure final extension
-      if (mode === "compress") {
-        producedPath = await ensureProperExtension(producedPath, inputExt);
-      } else {
-        const finalTarget = requestedTarget || extOfFilename(producedPath) || inputExt;
-        producedPath = await ensureProperExtension(producedPath, finalTarget);
-      }
+      // ensure extension correctness
+      const finalTarget = (mode === "compress") ? inputExt : (requestedTarget || extOfFilename(producedPath) || inputExt);
+      producedPath = await ensureProperExtension(producedPath, finalTarget);
 
       const outExt = extOfFilename(producedPath);
       const fileName = `${path.parse(originalName).name.replace(/\s+/g, "_")}.${outExt}`;
       const mimeType = mapMimeByExt(outExt);
       const stat = fs.statSync(producedPath);
 
-      // Stream file using pipeline and wait for completion before cleanup (prevents premature close / network fail)
+      // Stream via pipeline and wait for completion before cleanup
       res.writeHead(200, {
         "Content-Type": mimeType,
         "Content-Length": stat.size,
@@ -453,25 +509,28 @@ router.post("/", (req, res) => {
       });
 
       const readStream = fs.createReadStream(producedPath);
-
-      // When pipeline resolves, the full file has been sent.
       await pipe(readStream, res);
 
-      // cleanup only after full send
+      // Cleanup after full send
       await safeCleanup(producedPath);
       await safeCleanup(inputPath);
-      // NOTE: response already ended by pipeline
+      // remove work dir if created
+      if (usedWorkDir) {
+        try { await fsp.rmdir(usedWorkDir, { recursive: true }); } catch (e) {}
+      }
 
     } catch (e) {
-      console.error("❌ Conversion/Compression error:", e && e.message);
-      // try to remove partial produced file if any
+      console.error("❌ Conversion/Compression error:", e && (e.message || e));
+      // attempt cleanup
       try { if (producedPath) await safeCleanup(producedPath); } catch (er) {}
-      await safeCleanup(inputPath);
-      if (!res.headersSent) return res.status(500).json({ error: e.message });
-      // if headers already sent, we can't send JSON; just end connection
+      try { await safeCleanup(inputPath); } catch (er) {}
+      // don't leak work dirs
+      try { if (usedWorkDir) await fsp.rmdir(usedWorkDir, { recursive: true }); } catch (er) {}
+      if (!res.headersSent) return res.status(500).json({ error: e.message || String(e) });
       try { res.end(); } catch {}
     }
   });
 });
 
 module.exports = router;
+                                        
