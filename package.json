@@ -35,6 +35,7 @@
     "path": "^0.12.7",
     "fs-extra": "^11.2.0",
      "mammoth": "^1.7.0",
+    "async-mutex": "^0.4.0",
     
     
     "pdf-parse": "^1.1.1"    
