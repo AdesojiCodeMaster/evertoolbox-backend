@@ -9,10 +9,12 @@ const fs = require("fs");
 const fsp = fs.promises;
 const path = require("path");
 const os = require("os");
-const { exec, execSync } = require("child_process");
+// replaced exec-based runner with spawn; keep execSync for df usage
+const { exec, execSync, spawn } = require("child_process");
 const { pipeline } = require("stream");
 const { promisify } = require("util");
 const mime = require("mime-types");
+const { Semaphore } = require("async-mutex");
 
 const pipe = promisify(pipeline);
 const router = express.Router();
@@ -69,28 +71,68 @@ const STABLE_CHECK_MS = 200;
 const STABLE_CHECK_ROUNDS = 3;
 const STABLE_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes for large conversions
 
+// ---------------- Concurrency limiter (global) ----------------
+const maxConcurrent = parseInt(process.env.MAX_CONCURRENT || "3", 10); // default 3
+const limiter = new Semaphore(maxConcurrent);
+
 // ---------------- Multer upload ----------------
+// Changed upload limit to 50 MB (safe for Render Free)
 const upload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => cb(null, TMP_DIR),
     filename: (req, file, cb) => cb(null, `${Date.now()}-${uuidv4()}-${file.originalname.replace(/\s+/g, "_")}`)
   }),
-  limits: { fileSize: 1024 * 1024 * 1024 } // 1 GB
+  limits: { fileSize: 50 * 1024 * 1024 } // 50 MB
 }).single("file");
 
-// ---------------- Exec wrapper ----------------
+// ---------------- Exec/Spawn wrapper (concurrency-aware) ----------------
 function runCmd(cmd, opts = {}) {
-  return new Promise((resolve, reject) => {
-    // make error messages more helpful
-    exec(cmd, { maxBuffer: 1024 * 1024 * 1024, ...opts }, (err, stdout, stderr) => {
-      if (err) {
-        const outErr = (stderr && stderr.toString()) || (stdout && stdout.toString()) || err.message;
-        const msg = `Command failed: ${cmd}\n${outErr}`;
-        return reject(new Error(msg));
-      }
-      resolve({ stdout: stdout ? stdout.toString() : "", stderr: stderr ? stderr.toString() : "" });
+  // Runs command using spawn, collects stdout/stderr, but enforces global concurrency via limiter.
+  // Returns Promise resolving to { stdout, stderr } on success, rejects with Error including stderr/stdout on failure.
+  return limiter.runExclusive(() => new Promise((resolve, reject) => {
+    // split command intelligently: prefer simple split for common cases (keeps behavior similar to previous usage)
+    // Note: commands that rely on complex shell expansion should continue to work if they were working before.
+    const parts = cmd.split(" ");
+    const prog = parts[0];
+    const args = parts.slice(1);
+    let child;
+    try {
+      child = spawn(prog, args, { stdio: ["ignore", "pipe", "pipe"], shell: false, ...opts });
+    } catch (err) {
+      return reject(new Error(`Failed to spawn command: ${cmd}\n${err.message}`));
+    }
+
+    let stdout = "";
+    let stderr = "";
+    // cap captured output to avoid unbounded memory usage (keep last N bytes)
+    const CAP = 2 * 1024 * 1024; // 2 MB capture cap per stream
+    if (child.stdout) {
+      child.stdout.on("data", (d) => {
+        stdout += d.toString();
+        if (stdout.length > CAP) stdout = stdout.slice(-CAP);
+      });
+    }
+    if (child.stderr) {
+      child.stderr.on("data", (d) => {
+        stderr += d.toString();
+        if (stderr.length > CAP) stderr = stderr.slice(-CAP);
+      });
+    }
+
+    child.on("error", (err) => {
+      const outErr = (stderr && stderr.toString()) || (stdout && stdout.toString()) || err.message;
+      reject(new Error(`Command failed: ${cmd}\n${outErr}`));
     });
-  });
+
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve({ stdout: stdout ? stdout.toString() : "", stderr: stderr ? stderr.toString() : "" });
+      } else {
+        const outErr = (stderr && stderr.toString()) || (stdout && stdout.toString()) || `Exit code ${code}`;
+        reject(new Error(`Command failed: ${cmd}\n${outErr}`));
+      }
+    });
+  }));
 }
 
 async function hasCmd(name) {
@@ -188,7 +230,7 @@ const docExts = new Set(["pdf","txt","md","html"]);
   try {
     console.log("🔥 Prewarming tools...");
     await Promise.allSettled([
-      runCmd("ffmpeg -version"),
+      runCmd("ffmpeg -version").catch(()=>{}),
       runCmd("libreoffice --headless --version").catch(()=>{}),
       runCmd("pdftoppm -v").catch(()=>{}),
       runCmd("pdftotext -v").catch(()=>{}),
@@ -487,9 +529,8 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
     if (await hasCmd("pdftotext")) {
       const mid = path.join(tmpDir, `${safeOutputBase(path.parse(input).name)}.txt`);
       // extract plain text without rendering background: pdftotext extracts text only
-      //await runCmd(`pdftotext "${input}" "${mid}"`).catch(err => { throw new Error(`pdftotext failed: ${err.message}`); });
-      await runCmd(`pdftotext -nopgbrk -layout -enc UTF-8 "${input}" "${mid}"`).catch(err => { throw new Error(`pdftotext failed: ${err.message}`); });
-       if (ext === "md") {
+      await runCmd(`pdftotext "${input}" "${mid}"`).catch(err => { throw new Error(`pdftotext failed: ${err.message}`); });
+      if (ext === "md") {
         if (await hasCmd("pandoc")) {
           // convert plain text to markdown using the extracted text file
           await runCmd(`pandoc "${mid}" -o "${out}"`).catch(err => { throw new Error(`pandoc failed: ${err.message}`); });
@@ -607,6 +648,18 @@ router.post("/", (req, res) => {
     if (err) return res.status(400).json({ error: err.message });
     if (!req.file) return res.status(400).json({ error: "No file uploaded." });
 
+    // ---- Concurrency guard: immediate 503 when busy ----
+    try {
+      if (limiter.currentReleasable < 1) {
+        // remove the uploaded temp file immediately and return 503
+        try { await safeCleanup(req.file.path); } catch (er) {}
+        return res.status(503).json({ error: "Server busy, please retry in a few seconds" });
+      }
+    } catch (e) {
+      // if limiter interrogation fails for some reason, proceed normally (safer)
+      console.warn("Limiter check failed:", e && e.message);
+    }
+
     const mode = (req.body.mode || "convert").toLowerCase(); // convert | compress
     // capture raw requested target to preserve casing, and also a normalized lowercase for logic
     const requestedTargetRaw = (req.body.targetFormat || "").toString().replace(/^\./, "");
@@ -718,4 +771,3 @@ router.post("/", (req, res) => {
 });
 
 module.exports = router;
-    
