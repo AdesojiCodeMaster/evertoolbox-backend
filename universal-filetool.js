@@ -9,12 +9,10 @@ const fs = require("fs");
 const fsp = fs.promises;
 const path = require("path");
 const os = require("os");
-// replaced exec-based runner with spawn; keep execSync for df usage
-const { exec, execSync, spawn } = require("child_process");
+const { exec, execSync } = require("child_process");
 const { pipeline } = require("stream");
 const { promisify } = require("util");
 const mime = require("mime-types");
-const { Semaphore } = require("async-mutex");
 
 const pipe = promisify(pipeline);
 const router = express.Router();
@@ -71,68 +69,28 @@ const STABLE_CHECK_MS = 200;
 const STABLE_CHECK_ROUNDS = 3;
 const STABLE_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes for large conversions
 
-// ---------------- Concurrency limiter (global) ----------------
-const maxConcurrent = parseInt(process.env.MAX_CONCURRENT || "3", 10); // default 3
-const limiter = new Semaphore(maxConcurrent);
-
 // ---------------- Multer upload ----------------
-// Changed upload limit to 50 MB (safe for Render Free)
 const upload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => cb(null, TMP_DIR),
     filename: (req, file, cb) => cb(null, `${Date.now()}-${uuidv4()}-${file.originalname.replace(/\s+/g, "_")}`)
   }),
-  limits: { fileSize: 50 * 1024 * 1024 } // 50 MB
+  limits: { fileSize: 1024 * 1024 * 1024 } // 1 GB
 }).single("file");
 
-// ---------------- Exec/Spawn wrapper (concurrency-aware) ----------------
+// ---------------- Exec wrapper ----------------
 function runCmd(cmd, opts = {}) {
-  // Runs command using spawn, collects stdout/stderr, but enforces global concurrency via limiter.
-  // Returns Promise resolving to { stdout, stderr } on success, rejects with Error including stderr/stdout on failure.
-  return limiter.runExclusive(() => new Promise((resolve, reject) => {
-    // split command intelligently: prefer simple split for common cases (keeps behavior similar to previous usage)
-    // Note: commands that rely on complex shell expansion should continue to work if they were working before.
-    const parts = cmd.split(" ");
-    const prog = parts[0];
-    const args = parts.slice(1);
-    let child;
-    try {
-      child = spawn(prog, args, { stdio: ["ignore", "pipe", "pipe"], shell: false, ...opts });
-    } catch (err) {
-      return reject(new Error(`Failed to spawn command: ${cmd}\n${err.message}`));
-    }
-
-    let stdout = "";
-    let stderr = "";
-    // cap captured output to avoid unbounded memory usage (keep last N bytes)
-    const CAP = 2 * 1024 * 1024; // 2 MB capture cap per stream
-    if (child.stdout) {
-      child.stdout.on("data", (d) => {
-        stdout += d.toString();
-        if (stdout.length > CAP) stdout = stdout.slice(-CAP);
-      });
-    }
-    if (child.stderr) {
-      child.stderr.on("data", (d) => {
-        stderr += d.toString();
-        if (stderr.length > CAP) stderr = stderr.slice(-CAP);
-      });
-    }
-
-    child.on("error", (err) => {
-      const outErr = (stderr && stderr.toString()) || (stdout && stdout.toString()) || err.message;
-      reject(new Error(`Command failed: ${cmd}\n${outErr}`));
-    });
-
-    child.on("close", (code) => {
-      if (code === 0) {
-        resolve({ stdout: stdout ? stdout.toString() : "", stderr: stderr ? stderr.toString() : "" });
-      } else {
-        const outErr = (stderr && stderr.toString()) || (stdout && stdout.toString()) || `Exit code ${code}`;
-        reject(new Error(`Command failed: ${cmd}\n${outErr}`));
+  return new Promise((resolve, reject) => {
+    // make error messages more helpful
+    exec(cmd, { maxBuffer: 1024 * 1024 * 1024, ...opts }, (err, stdout, stderr) => {
+      if (err) {
+        const outErr = (stderr && stderr.toString()) || (stdout && stdout.toString()) || err.message;
+        const msg = `Command failed: ${cmd}\n${outErr}`;
+        return reject(new Error(msg));
       }
+      resolve({ stdout: stdout ? stdout.toString() : "", stderr: stderr ? stderr.toString() : "" });
     });
-  }));
+  });
 }
 
 async function hasCmd(name) {
@@ -230,7 +188,7 @@ const docExts = new Set(["pdf","txt","md","html"]);
   try {
     console.log("🔥 Prewarming tools...");
     await Promise.allSettled([
-      runCmd("ffmpeg -version").catch(()=>{}),
+      runCmd("ffmpeg -version"),
       runCmd("libreoffice --headless --version").catch(()=>{}),
       runCmd("pdftoppm -v").catch(()=>{}),
       runCmd("pdftotext -v").catch(()=>{}),
@@ -285,6 +243,70 @@ async function renderPdfWithGs(inputPdf, outFile, format = "png", dpi = 200) {
   console.log("📄 gs render:", gsCmd);
   await runCmd(gsCmd);
   return outFile;
+}
+
+// ---------------- NEW HELPER: sanitize text/markdown outputs ----------------
+// Purpose: remove ANSI color codes, NULs; if file looks like HTML convert to text/markdown
+// using pandoc (if available). This prevents outputs that embed CSS (dark backgrounds)
+// or stray ANSI color escapes which might cause "dark" appearance in viewers.
+async function sanitizeTextOrMarkdown(filePath, targetExt, tmpDir) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return filePath;
+    const buf = await fsp.readFile(filePath);
+    let s = buf.toString("utf8");
+
+    // Remove NUL bytes which sometimes appear from binary->text conversions
+    if (s.indexOf("\0") !== -1) s = s.replace(/\0+/g, "");
+
+    // Strip ANSI color codes (e.g. ESC[...m)
+    s = s.replace(/\x1b\[[0-9;]*m/g, "");
+
+    // Trim leading/trailing whitespace
+    s = s.replace(/^\s+/, "").replace(/\s+$/, "");
+
+    // If the content looks like HTML (starts with <html> or <!doctype html>), try to convert it
+    // to markdown/plain using pandoc (if available), otherwise strip tags as a fallback.
+    const looksLikeHtml = /^\s*(?:<!doctype html|<html|<head|<body)/i.test(s);
+
+    const desiredExt = (targetExt || path.extname(filePath).replace(".", "") || "").toLowerCase();
+
+    if (looksLikeHtml) {
+      if (await hasCmd("pandoc")) {
+        // create a temporary input HTML file (overwrite original) and run pandoc to target format
+        const tempHtml = filePath + ".html";
+        await fsp.writeFile(tempHtml, s, "utf8");
+        const pandocTarget = (desiredExt === "md") ? "markdown" : "plain";
+        const outTemp = filePath + ".sanitized";
+        // use pandoc to convert; if markdown requested produce markdown, else plain text
+        await runCmd(`pandoc "${tempHtml}" -f html -t ${pandocTarget} -o "${outTemp}"`).catch(err => { throw new Error(`pandoc sanitization failed: ${err.message}`); });
+        if (fs.existsSync(outTemp)) {
+          await fsp.rename(outTemp, filePath);
+          await safeCleanup(tempHtml);
+          // Re-read sanitized content for any further cleaning
+          const s2 = await fsp.readFile(filePath, "utf8");
+          await fsp.writeFile(filePath, s2.replace(/\x1b\[[0-9;]*m/g, ""), "utf8");
+          return filePath;
+        } else {
+          // fallback: continue to simple stripping below
+          await safeCleanup(tempHtml);
+        }
+      } else {
+        // naive fallback: remove tags (best-effort), leaving text content
+        const textOnly = s.replace(/<script[\s\S]*?<\/script>/gi, "")
+                          .replace(/<style[\s\S]*?<\/style>/gi, "")
+                          .replace(/<\/?[^>]+(>|$)/g, "");
+        await fsp.writeFile(filePath, textOnly.replace(/\x1b\[[0-9;]*m/g, ""), "utf8");
+        return filePath;
+      }
+    }
+
+    // If not HTML, just write cleaned text back
+    await fsp.writeFile(filePath, s, "utf8");
+    return filePath;
+  } catch (err) {
+    console.warn("sanitizeTextOrMarkdown failed:", err && err.message);
+    return filePath;
+  }
 }
 
 // ---------------- Audio conversion ----------------
@@ -529,22 +551,27 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
     if (await hasCmd("pdftotext")) {
       const mid = path.join(tmpDir, `${safeOutputBase(path.parse(input).name)}.txt`);
       // extract plain text without rendering background: pdftotext extracts text only
-     // await runCmd(`pdftotext "${input}" "${mid}"`).catch(err => { throw new Error(`pdftotext failed: ${err.message}`); });
-      await runCmd(`pdftotext -nopgbrk -layout -enc UTF-8 ${input} ${mid}`).catch(err => { throw new Error(`pdftotext failed: ${err.message}`); });
-     if (ext === "md") {
+      await runCmd(`pdftotext "${input}" "${mid}"`).catch(err => { throw new Error(`pdftotext failed: ${err.message}`); });
+      if (ext === "md") {
         if (await hasCmd("pandoc")) {
           // convert plain text to markdown using the extracted text file
           await runCmd(`pandoc "${mid}" -o "${out}"`).catch(err => { throw new Error(`pandoc failed: ${err.message}`); });
           await safeCleanup(mid);
+          // sanitize final markdown to remove stray HTML/ANSI if any
+          await sanitizeTextOrMarkdown(out, "md", tmpDir);
           return out;
         } else {
           // if pandoc not available, return the raw text renamed to .md
           await fsp.rename(mid, out).catch(()=>{});
+          // sanitize raw text
+          await sanitizeTextOrMarkdown(out, "md", tmpDir);
           return out;
         }
       }
       // ext === txt
       await fsp.rename(mid, out);
+      // sanitize final text
+      await sanitizeTextOrMarkdown(out, "txt", tmpDir);
       return out;
     } else throw new Error("pdftotext not available for PDF->text conversion");
   }
@@ -571,6 +598,10 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
     if (["png","jpg","jpeg","webp"].includes(ext)) await flattenImageWhite(gen, gen);
     await fsp.rename(gen, out).catch(()=>{});
     if (!(await waitForStableFileSize(out))) throw new Error("Document conversion failed: output unstable or empty");
+    // If the produced file is plain text / markdown, sanitize it to remove HTML/CSS/ANSI artifacts
+    if (["txt","md"].includes(ext)) {
+      await sanitizeTextOrMarkdown(out, ext, tmpDir);
+    }
     // honor requested casing for jpeg/JPG
     if ((ext === "jpeg" || ext === "jpg") && extRequested && extRequested !== ext) {
       const desired = fixOutputExtension(out, extRequested);
@@ -648,18 +679,6 @@ router.post("/", (req, res) => {
   upload(req, res, async function (err) {
     if (err) return res.status(400).json({ error: err.message });
     if (!req.file) return res.status(400).json({ error: "No file uploaded." });
-
-    // ---- Concurrency guard: immediate 503 when busy ----
-    try {
-      if (limiter.currentReleasable < 1) {
-        // remove the uploaded temp file immediately and return 503
-        try { await safeCleanup(req.file.path); } catch (er) {}
-        return res.status(503).json({ error: "Server busy, please retry in a few seconds" });
-      }
-    } catch (e) {
-      // if limiter interrogation fails for some reason, proceed normally (safer)
-      console.warn("Limiter check failed:", e && e.message);
-    }
 
     const mode = (req.body.mode || "convert").toLowerCase(); // convert | compress
     // capture raw requested target to preserve casing, and also a normalized lowercase for logic
@@ -772,3 +791,4 @@ router.post("/", (req, res) => {
 });
 
 module.exports = router;
+  
