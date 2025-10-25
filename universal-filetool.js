@@ -529,8 +529,9 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
     if (await hasCmd("pdftotext")) {
       const mid = path.join(tmpDir, `${safeOutputBase(path.parse(input).name)}.txt`);
       // extract plain text without rendering background: pdftotext extracts text only
-      await runCmd(`pdftotext "${input}" "${mid}"`).catch(err => { throw new Error(`pdftotext failed: ${err.message}`); });
-      if (ext === "md") {
+     // await runCmd(`pdftotext "${input}" "${mid}"`).catch(err => { throw new Error(`pdftotext failed: ${err.message}`); });
+      await runCmd(`pdftotext -nopgbrk -layout -enc UTF-8 ${input} ${mid}`).catch(err => { throw new Error(`pdftotext failed: ${err.message}`); });
+     if (ext === "md") {
         if (await hasCmd("pandoc")) {
           // convert plain text to markdown using the extracted text file
           await runCmd(`pandoc "${mid}" -o "${out}"`).catch(err => { throw new Error(`pandoc failed: ${err.message}`); });
