@@ -4,7 +4,7 @@
 //
 // NOTES:
 // - Tuned for Render free/low-tier use: 50 MB upload limit, concurrency cap (3 concurrent jobs).
-// - To reduce OOM risk on tiny instances, child process stdout/stderr buffer limited to 100MB.
+// - Child process stdout/stderr buffer limited to 100MB to reduce OOM risk on small instances.
 // - For best reliability on Render free tier, consider adding a start script to clear /tmp on boot:
 //     "start": "rm -rf /tmp/* && node server.js"
 // - This file preserves original logic and comments; only safe, localized adjustments were made.
@@ -114,9 +114,6 @@ async function hasCmd(name) {
 async function findMagickCmd() {
   try { await runCmd("magick -version"); return "magick"; }
   catch { try { await runCmd("convert -version"); return "convert"; } catch { return null; } }
-}
-async function hasPdftocairo() {
-  try { await runCmd("which pdftocairo"); return true; } catch { return false; }
 }
 
 // ---------------- Utilities ----------------
@@ -261,62 +258,63 @@ async function renderPdfWithGs(inputPdf, outFile, format = "png", dpi = 200) {
 }
 
 // ---------------- NEW HELPER: sanitize text/markdown outputs ----------------
-// Purpose: remove ANSI color codes, NULs; if file looks like HTML convert to text/markdown
-// using pandoc (if available). This prevents outputs that embed CSS (dark backgrounds)
-// or stray ANSI color escapes which might cause "dark" appearance in viewers.
+// Purpose: remove ANSI color codes, NULs; strip HTML/CSS background styles and inline styles
+// to remove dark background artifacts from converted .md / .txt files.
 async function sanitizeTextOrMarkdown(filePath, targetExt, tmpDir) {
   try {
     if (!filePath || !fs.existsSync(filePath)) return filePath;
-    const buf = await fsp.readFile(filePath);
-    let s = buf.toString("utf8");
+    let s = await fsp.readFile(filePath, "utf8");
 
     // Remove NUL bytes which sometimes appear from binary->text conversions
     if (s.indexOf("\0") !== -1) s = s.replace(/\0+/g, "");
 
     // Strip ANSI color codes (e.g. ESC[...m)
-    s = s.replace(/\x1b\[[0-9;]*m/g, "");
+    s = s.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
 
-    // Trim leading/trailing whitespace
-    s = s.replace(/^\s+/, "").replace(/\s+$/, "");
+    // Remove entire <style>...</style> blocks which might contain background CSS
+    s = s.replace(/<style[\s\S]*?>[\s\S]*?<\/style>/gi, "");
 
-    // If the content looks like HTML (starts with <html> or <!doctype html>), try to convert it
-    // to markdown/plain using pandoc (if available), otherwise strip tags as a fallback.
-    const looksLikeHtml = /^\s*(?:<!doctype html|<html|<head|<body)/i.test(s);
-
-    const desiredExt = (targetExt || path.extname(filePath).replace(".", "") || "").toLowerCase();
-
-    if (looksLikeHtml) {
-      if (await hasCmd("pandoc")) {
-        // create a temporary input HTML file (overwrite original) and run pandoc to target format
-        const tempHtml = filePath + ".html";
-        await fsp.writeFile(tempHtml, s, "utf8");
-        const pandocTarget = (desiredExt === "md") ? "markdown" : "plain";
-        const outTemp = filePath + ".sanitized";
-        // use pandoc to convert; if markdown requested produce markdown, else plain text
-        await runCmd(`pandoc "${tempHtml}" -f html -t ${pandocTarget} -o "${outTemp}"`).catch(err => { throw new Error(`pandoc sanitization failed: ${err.message}`); });
-        if (fs.existsSync(outTemp)) {
-          await fsp.rename(outTemp, filePath);
-          await safeCleanup(tempHtml);
-          // Re-read sanitized content for any further cleaning
-          const s2 = await fsp.readFile(filePath, "utf8");
-          await fsp.writeFile(filePath, s2.replace(/\x1b\[[0-9;]*m/g, ""), "utf8");
-          return filePath;
-        } else {
-          // fallback: continue to simple stripping below
-          await safeCleanup(tempHtml);
-        }
+    // Remove inline style attributes that include background or color rules
+    // e.g. <span style="background:#000;color:#fff"> -> remove style attribute entirely
+    s = s.replace(/(<[a-zA-Z0-9]+\b[^>]*?)\sstyle=(["'])(.*?)\2/gi, (m, startTag, q, styleContent) => {
+      // If styleContent contains background or color properties, drop the style attribute.
+      // Otherwise keep tag without style attribute.
+      if (/background(?:-color)?\s*:|background\s*:|color\s*:/i.test(styleContent)) {
+        return startTag;
       } else {
-        // naive fallback: remove tags (best-effort), leaving text content
-        const textOnly = s.replace(/<script[\s\S]*?<\/script>/gi, "")
-                          .replace(/<style[\s\S]*?<\/style>/gi, "")
-                          .replace(/<\/?[^>]+(>|$)/g, "");
-        await fsp.writeFile(filePath, textOnly.replace(/\x1b\[[0-9;]*m/g, ""), "utf8");
-        return filePath;
+        return startTag;
       }
-    }
+    });
 
-    // If not HTML, just write cleaned text back
+    // Remove any inline background-color or background CSS fragments left in text
+    s = s.replace(/background(?:-color)?\s*:\s*[^;"})+]+;?/gi, "");
+    s = s.replace(/background\s*:\s*[^;"})+]+;?/gi, "");
+
+    // Remove span tags that might carry background via attributes (best-effort)
+    s = s.replace(/<\/?span[^>]*>/gi, "");
+
+    // Remove other HTML tags but preserve their inner text (convert to plain text)
+    // Keep simple line breaks for readability
+    s = s.replace(/<\/?(?:div|p|h[1-6]|section|article)[^>]*>/gi, "\n");
+    s = s.replace(/<\/?br[^>]*>/gi, "\n");
+    // Remove remaining tags but keep content
+    s = s.replace(/<\/?[^>]+(>|$)/g, "");
+
+    // Trim leading/trailing whitespace and collapse multiple blank lines
+    s = s.replace(/^\s+/, "").replace(/\s+$/, "");
+    s = s.replace(/\n{3,}/g, "\n\n");
+
+    // Basic HTML entity decoding for common entities to avoid rendering oddness
+    s = s.replace(/&nbsp;/g, " ")
+         .replace(/&amp;/g, "&")
+         .replace(/&lt;/g, "<")
+         .replace(/&gt;/g, ">")
+         .replace(/&quot;/g, '"')
+         .replace(/&#39;/g, "'");
+
+    // Write sanitized content back
     await fsp.writeFile(filePath, s, "utf8");
+
     return filePath;
   } catch (err) {
     console.warn("sanitizeTextOrMarkdown failed:", err && err.message);
@@ -572,7 +570,7 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
           // convert plain text to markdown using the extracted text file
           await runCmd(`pandoc "${mid}" -o "${out}"`).catch(err => { throw new Error(`pandoc failed: ${err.message}`); });
           await safeCleanup(mid);
-          // sanitize final markdown to remove stray HTML/ANSI if any
+          // sanitize final markdown to remove stray HTML/ANSI/CSS if any
           await sanitizeTextOrMarkdown(out, "md", tmpDir);
           return out;
         } else {
@@ -799,6 +797,12 @@ router.post("/", (req, res) => {
         }
       }
 
+      // For safety: if final is txt or md, sanitize again (catch any path that missed earlier sanitization)
+      const finalOutExt = extOfFilename(producedPath).toLowerCase();
+      if (finalOutExt === "txt" || finalOutExt === "md") {
+        await sanitizeTextOrMarkdown(producedPath, finalOutExt, tmpDir);
+      }
+
       const outExt = extOfFilename(producedPath);
       const fileName = `${path.parse(originalName).name.replace(/\s+/g, "_")}.${outExt}`;
       const mimeType = mapMimeByExt(outExt);
@@ -837,4 +841,4 @@ router.post("/", (req, res) => {
 });
 
 module.exports = router;
-                     
+  
