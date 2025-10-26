@@ -1,6 +1,13 @@
 // universal-filetool.js (FINAL - fully integrated, naked downloads only)
 // Requirements in runtime image: ffmpeg, libreoffice, poppler-utils (pdftoppm/pdftotext), ghostscript (gs),
 // imagemagick (magick or convert), pandoc (optional). No zip fallback. Uses /dev/shm when present.
+//
+// NOTES:
+// - Tuned for Render free/low-tier use: 50 MB upload limit, concurrency cap (3 concurrent jobs).
+// - To reduce OOM risk on tiny instances, child process stdout/stderr buffer limited to 100MB.
+// - For best reliability on Render free tier, consider adding a start script to clear /tmp on boot:
+//     "start": "rm -rf /tmp/* && node server.js"
+// - This file preserves original logic and comments; only safe, localized adjustments were made.
 
 const express = require("express");
 const multer = require("multer");
@@ -69,20 +76,28 @@ const STABLE_CHECK_MS = 200;
 const STABLE_CHECK_ROUNDS = 3;
 const STABLE_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes for large conversions
 
+// ---------------- Concurrency limiter (for Render free/low-tier stability) ----------------
+// Allow up to 3 concurrent conversion/compression jobs by default.
+// Tune via environment variable if needed: process.env.MAX_CONCURRENT_JOBS
+let activeJobs = 0;
+const MAX_CONCURRENT_JOBS = Number(process.env.MAX_CONCURRENT_JOBS || 3);
+
 // ---------------- Multer upload ----------------
+// Adjusted upload limit to 50 MB to suit Render free/low-tier environments
 const upload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => cb(null, TMP_DIR),
     filename: (req, file, cb) => cb(null, `${Date.now()}-${uuidv4()}-${file.originalname.replace(/\s+/g, "_")}`)
   }),
-  limits: { fileSize: 1024 * 1024 * 1024 } // 1 GB
+  limits: { fileSize: 50 * 1024 * 1024 } // 50 MB
 }).single("file");
 
 // ---------------- Exec wrapper ----------------
 function runCmd(cmd, opts = {}) {
   return new Promise((resolve, reject) => {
     // make error messages more helpful
-    exec(cmd, { maxBuffer: 1024 * 1024 * 1024, ...opts }, (err, stdout, stderr) => {
+    // NOTE: lowered maxBuffer to 100MB to reduce OOM risk on small instances
+    exec(cmd, { maxBuffer: 100 * 1024 * 1024, ...opts }, (err, stdout, stderr) => {
       if (err) {
         const outErr = (stderr && stderr.toString()) || (stdout && stdout.toString()) || err.message;
         const msg = `Command failed: ${cmd}\n${outErr}`;
@@ -676,10 +691,38 @@ router.post("/", (req, res) => {
   try { req.setTimeout(0); } catch (e) {}
   try { res.setTimeout(0); } catch (e) {}
 
-  upload(req, res, async function (err) {
-    if (err) return res.status(400).json({ error: err.message });
-    if (!req.file) return res.status(400).json({ error: "No file uploaded." });
+  // Concurrency guard BEFORE accepting upload: prevents writing temp files when we're busy
+  if (activeJobs >= MAX_CONCURRENT_JOBS) {
+    return res.status(503).json({ error: `Server busy, please try again in a few seconds.` });
+  }
 
+  activeJobs++;
+  let cleared = false;
+  const clearJob = () => {
+    if (!cleared) {
+      cleared = true;
+      activeJobs = Math.max(0, activeJobs - 1);
+      // small log to help observability
+      console.log(`🧭 Job finished/cleared. activeJobs=${activeJobs}`);
+    }
+  };
+  // ensure we clear job count on response end/close
+  res.on("finish", clearJob);
+  res.on("close", clearJob);
+
+  upload(req, res, async function (err) {
+    // ensure cleanup of active job if upload fails before we enter main flow
+    if (err) {
+      console.warn("Multer/upload error:", err && err.message);
+      try { clearJob(); } catch (e) {}
+      return res.status(400).json({ error: err.message });
+    }
+    if (!req.file) {
+      try { clearJob(); } catch (e) {}
+      return res.status(400).json({ error: "No file uploaded." });
+    }
+
+    // Everything below is unchanged from original logic, only enclosed within concurrency guard
     const mode = (req.body.mode || "convert").toLowerCase(); // convert | compress
     // capture raw requested target to preserve casing, and also a normalized lowercase for logic
     const requestedTargetRaw = (req.body.targetFormat || "").toString().replace(/^\./, "");
@@ -701,6 +744,7 @@ router.post("/", (req, res) => {
       // Guard: identical source and target format => disallow
       if (mode === "convert" && requestedTarget && requestedTarget === inputExt) {
         await safeCleanup(inputPath);
+        try { clearJob(); } catch (e) {}
         return res.status(400).json({ error: `Conversion disallowed: source and target formats are identical (.${inputExt})` });
       }
 
@@ -777,12 +821,14 @@ router.post("/", (req, res) => {
       await safeCleanup(producedPath);
       await safeCleanup(inputPath);
       // NOTE: response already ended by pipeline
+      try { clearJob(); } catch (e) {}
 
     } catch (e) {
       console.error("❌ Conversion/Compression error:", e && e.message);
       // try to remove partial produced file if any
       try { if (producedPath) await safeCleanup(producedPath); } catch (er) {}
       await safeCleanup(inputPath);
+      try { clearJob(); } catch (ee) {}
       if (!res.headersSent) return res.status(500).json({ error: e.message });
       // if headers already sent, we can't send JSON; just end connection
       try { res.end(); } catch {}
@@ -791,4 +837,4 @@ router.post("/", (req, res) => {
 });
 
 module.exports = router;
-  
+                     
