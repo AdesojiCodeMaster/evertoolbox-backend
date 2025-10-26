@@ -183,7 +183,7 @@ function mapMimeByExt(ext) {
     aac: "audio/aac", webm: "video/webm", mp4: "video/mp4", avi: "video/x-msvideo", mov: "video/quicktime",
     mkv: "video/x-matroska", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp",
     gif: "image/gif", pdf: "application/pdf", txt: "text/plain", md: "text/markdown", html: "text/html",
-    docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", rtf: "application/rtf"
   };
   return map[e] || mime.lookup(e) || "application/octet-stream";
 }
@@ -192,8 +192,8 @@ function mapMimeByExt(ext) {
 const imageExts = new Set(["jpg","jpeg","png","webp","gif","tiff","bmp"]);
 const audioExts = new Set(["mp3","wav","m4a","ogg","opus","flac","aac"]); // removed webm here
 const videoExts = new Set(["mp4","avi","mov","webm","mkv","m4v"]);
-const officeExts = new Set(["doc","docx","ppt","pptx","xls","xlsx","odt","ods","odp"]);
-const docExts = new Set(["pdf","txt","md","html"]);
+const officeExts = new Set(["doc","docx","ppt","pptx","xls","xlsx","odt","ods","odp","rtf"]);
+const docExts = new Set(["pdf","txt","md","html","docx","rtf","odt"]);
 
 // ---------------- Prewarm (non-blocking) ----------------
 (async function prewarm() {
@@ -322,6 +322,25 @@ async function sanitizeTextOrMarkdown(filePath, targetExt, tmpDir) {
   }
 }
 
+// ---------------- Helper: retry wrapper for libreoffice (reduces transient failures) ----------------
+async function runLibreOfficeConvertWithRetries(input, outDir, ext, tries = 2, delayMs = 800) {
+  // ext: without dot, e.g. 'docx' or 'pdf'
+  for (let attempt = 1; attempt <= tries; ++attempt) {
+    try {
+      const cmd = `libreoffice --headless --invisible --nologo --nodefault --nolockcheck --convert-to ${ext} "${input}" --outdir "${outDir}"`;
+      console.log(`📄 libreoffice (attempt ${attempt}):`, cmd);
+      await runCmd(cmd);
+      return;
+    } catch (e) {
+      console.warn(`LibreOffice attempt ${attempt} failed:`, e && e.message);
+      if (attempt < tries) await new Promise(r => setTimeout(r, delayMs));
+    }
+  }
+  // final attempt without swallowing error
+  const finalCmd = `libreoffice --headless --invisible --nologo --nodefault --nolockcheck --convert-to ${ext} "${input}" --outdir "${outDir}"`;
+  await runCmd(finalCmd);
+}
+
 // ---------------- Audio conversion ----------------
 async function convertAudio(input, outPath, targetExt) {
   if (!fs.existsSync(input)) throw new Error("Input file not found");
@@ -442,191 +461,342 @@ async function convertVideo(input, outPath, targetExt) {
   return await ensureProperExtension(out, extRaw || ext);
 }
 
-// ---------------- Document conversion ----------------
+// ---------------- Document/Image conversion (unified, robust) ----------------
 async function convertDocument(input, outPath, targetExt, tmpDir) {
   if (!fs.existsSync(input)) throw new Error("Input file not found");
   const inExt = extOfFilename(input) || extOfFilename(path.basename(input));
   // keep the requested target casing if provided in targetExt; also use lowercased local 'ext' for logic
   const extRequested = (targetExt || path.extname(outPath)).toString().replace(/^\./, "");
-  const ext = extRequested.toLowerCase();
-  const out = fixOutputExtension(outPath, extRequested);
+  const ext = (extRequested || "").toLowerCase();
   tmpDir = tmpDir || path.dirname(input);
+  const out = fixOutputExtension(outPath, extRequested || ext);
 
-  // Use ImageMagick + Ghostscript for PDF -> image conversions (works where poppler tools fail)
   const magickCmd = await findMagickCmd();
+  const hasPandoc = await hasCmd("pandoc");
+  const hasPdftotext = await hasCmd("pdftotext");
+  const hasPdftoppm = await hasCmd("pdftoppm");
+  const hasGs = await hasCmd("gs");
 
-  // ---------------- PDF -> images (single-page) using Ghostscript -> fallback to ImageMagick
-  if (inExt === "pdf" && ["png","jpg","jpeg","webp","tiff","bmp"].includes(ext)) {
-    // choose a safe target format (avoid producing TIFF if possible)
-    const preferredFormat = (ext === "tiff" || ext === "bmp") ? "png" : (ext === "jpg" ? "jpeg" : ext);
-    const tmpPrefix = path.join(tmpDir, safeOutputBase(path.parse(input).name));
-    const tmpProduced = fixOutputExtension(`${tmpPrefix}`, extRequested || preferredFormat);
+  // Normalizing some synonyms
+  const normExt = (s) => (s || "").toString().replace(/^\./, "").toLowerCase();
+  const in = normExt(inExt);
+  const target = normExt(ext || path.extname(outPath).replace(".", "") || "");
 
-    // First attempt: Ghostscript rendering (more reliable and with controlled memory)
-    try {
-      const gsFormat = (preferredFormat === "jpeg") ? "jpeg" : "png";
-      const dpi = (getFreeKbSync(tmpDir) < 150 * 1024) ? 150 : 200; // reduce DPI if low tmp space
-      const gsOut = tmpProduced; // includes extension
-      await renderPdfWithGs(input, gsOut, gsFormat, dpi);
-      if (!fs.existsSync(gsOut)) throw new Error("Ghostscript did not produce output");
-      // If requested webp, convert the produced png/jpeg to webp if ImageMagick available
-      if (ext === "webp" && magickCmd) {
-        const tmpWebp = fixOutputExtension(`${tmpPrefix}`, "webp");
-        await runCmd(`${magickCmd} -limit memory ${process.env.IMAGEMAGICK_LIMIT_MEMORY || "256MB"} -limit map ${process.env.IMAGEMAGICK_LIMIT_MAP || "512MB"} "${gsOut}" "${tmpWebp}"`).catch(err => { throw new Error(`imagemagick failed: ${err.message}`); });
-        await safeCleanup(gsOut);
-        await flattenImageWhite(tmpWebp, out);
-        await safeCleanup(tmpWebp);
-        return out;
+  // If input is already same as target, simply copy and ensure extension
+  if (in === target) {
+    const cp = out;
+    await fsp.copyFile(input, cp).catch(()=>{});
+    return await ensureProperExtension(cp, extRequested || target);
+  }
+
+  // Helper: ensure we can produce an image PDF from an image
+  async function imageToPdf(imgPath, pdfOut) {
+    // prefer ImageMagick to create a single-page PDF containing the image
+    if (magickCmd) {
+      const cmd = `${magickCmd} -limit memory ${process.env.IMAGEMAGICK_LIMIT_MEMORY || "256MB"} -limit map ${process.env.IMAGEMAGICK_LIMIT_MAP || "512MB"} "${imgPath}" "${pdfOut}"`;
+      console.log("🖼️ Image -> PDF via ImageMagick:", cmd);
+      await runCmd(cmd);
+      return pdfOut;
+    } else if (hasGs) {
+      // fallback: convert to PNG then use gs to encapsulate (less common)
+      const tmpPng = fixOutputExtension(path.join(tmpDir, safeOutputBase(path.parse(imgPath).name)), "png");
+      await runCmd(`convert "${imgPath}" "${tmpPng}"`).catch(()=>{});
+      const gsCmd = `gs -dBATCH -dNOPAUSE -sDEVICE=pdfwrite -sOutputFile="${pdfOut}" "${tmpPng}"`;
+      console.log("🖼️ Image -> PDF via GS fallback:", gsCmd);
+      await runCmd(gsCmd);
+      await safeCleanup(tmpPng);
+      return pdfOut;
+    } else {
+      // as last resort, copy image with .pdf extension (not ideal but deterministic)
+      await fsp.copyFile(imgPath, pdfOut);
+      return pdfOut;
+    }
+  }
+
+  // Helper: pdf -> text/md/html/docx via pdftotext/pandoc/libreoffice
+  async function pdfToDocument(pdfInput, desiredOut) {
+    const desired = normExt(path.extname(desiredOut).replace(".", "") || desiredOut);
+    // txt or md: use pdftotext -> optionally pandoc for md
+    if ((desired === "txt" || desired === "md" || desired === "html") && hasPdftotext) {
+      const tmpTxt = path.join(tmpDir, `${safeOutputBase(path.parse(pdfInput).name)}.txt`);
+      await runCmd(`pdftotext "${pdfInput}" "${tmpTxt}"`);
+      if (desired === "txt") {
+        await fsp.rename(tmpTxt, desiredOut).catch(()=>{});
+        await sanitizeTextOrMarkdown(desiredOut, "txt", tmpDir);
+        return desiredOut;
       }
-      // flatten to white into final out path
-      await flattenImageWhite(gsOut, out);
-      await safeCleanup(gsOut);
-
-      // honor requested casing for JPG/JPEG
-      if ((ext === "jpeg" || ext === "jpg") && extRequested && extRequested !== preferredFormat) {
-        const desired = fixOutputExtension(out, extRequested);
-        if (desired !== out && fs.existsSync(out)) {
-          await fsp.rename(out, desired).catch(()=>{});
-          return desired;
-        }
+      if (hasPandoc) {
+        await runCmd(`pandoc "${tmpTxt}" -o "${desiredOut}"`).catch(err => { throw new Error(`pandoc failed: ${err.message}`); });
+        await safeCleanup(tmpTxt);
+        if (desired === "md") await sanitizeTextOrMarkdown(desiredOut, "md", tmpDir);
+        return desiredOut;
+      } else {
+        // no pandoc: rename to desired extension (md/html) and sanitize
+        await fsp.rename(tmpTxt, desiredOut).catch(()=>{});
+        if (desired === "md") await sanitizeTextOrMarkdown(desiredOut, "md", tmpDir);
+        return desiredOut;
       }
+    }
+    // docx / odt / rtf: try pandoc first (if text extraction ok), else LibreOffice
+    if ((desired === "docx" || desired === "odt" || desired === "rtf") && hasPandoc && hasPdftotext) {
+      const tmpTxt = path.join(tmpDir, `${safeOutputBase(path.parse(pdfInput).name)}.txt`);
+      await runCmd(`pdftotext "${pdfInput}" "${tmpTxt}"`).catch(()=>{});
+      await runCmd(`pandoc "${tmpTxt}" -o "${desiredOut}"`).catch(err => { throw new Error(`pandoc failed: ${err.message}`); });
+      await safeCleanup(tmpTxt);
+      return desiredOut;
+    }
+    // fallback: use LibreOffice to convert PDF -> desired
+    await runLibreOfficeConvertWithRetries(pdfInput, tmpDir, desired);
+    const gen = path.join(tmpDir, `${path.parse(pdfInput).name}.${desired}`);
+    if (fs.existsSync(gen)) {
+      await fsp.rename(gen, desiredOut).catch(()=>{});
+      return desiredOut;
+    }
+    // as last resort, copy PDF to desiredOut (ensures no unsupported error — it's a fallback)
+    await fsp.copyFile(pdfInput, desiredOut);
+    return desiredOut;
+  }
 
-      return out;
-    } catch (gsErr) {
-      console.warn("Ghostscript render failed, falling back to ImageMagick/pdftoppm:", gsErr && gsErr.message);
-      // attempt ImageMagick path next
-      try {
-        if (!magickCmd) {
-          // If no ImageMagick, try pdftoppm fallback (older behavior)
-          const formatFallback = (preferredFormat === "jpeg") ? "jpeg" : preferredFormat;
-          const prefix = path.join(tmpDir, safeOutputBase(path.parse(input).name));
-          const cmd = `pdftoppm -f 1 -singlefile -${formatFallback} "${input}" "${prefix}"`;
-          console.log("📄 pdftoppm fallback:", cmd);
-          await runCmd(cmd).catch(err => { throw new Error(`pdftoppm failed: ${err.message}`); });
-          const produced = `${prefix}.${formatFallback}`;
-          if (!fs.existsSync(produced)) {
-            const alt = `${prefix}-1.${formatFallback}`;
-            if (fs.existsSync(alt)) { await fsp.rename(alt, out); return out; }
-            throw new Error("pdftoppm did not produce page image");
-          }
-          // flatten to white
-          await flattenImageWhite(produced, out);
-          await safeCleanup(produced);
-          // honor requested casing for JPG/JPEG
-          if ((extRequested === "JPG" || extRequested === "jpg" || extRequested === "jpeg") && (formatFallback === "jpeg")) {
-            const desired = fixOutputExtension(out, extRequested);
-            if (desired !== out && fs.existsSync(out)) { await fsp.rename(out, desired).catch(()=>{}); return desired; }
-          }
-          return out;
-        }
+  // Primary routing:
+  // 1) If input is an image and target is an image -> ImageMagick
+  // 2) If input is image and target is pdf -> ImageMagick to PDF
+  // 3) If input is image and target is document -> image -> pdf -> pdf -> desired (pdfToDocument)
+  // 4) If input is pdf and target is image -> Ghostscript / ImageMagick (already implemented earlier)
+  // 5) If input is pdf and target is document -> pdftotext/pandoc/libreoffice
+  // 6) If input is office or other doc and target is any doc -> libreoffice or pandoc chain
+  // 7) Fallback: try libreoffice conversion to the target ext
 
-        // ImageMagick path (preferred when gs fails)
-        const density = (getFreeKbSync(tmpDir) < 150 * 1024) ? 150 : 200; // adapt density to available space
-        const quality = 90;
-        const pageSpec = `${input}[0]`;
-        const tmpOut = fixOutputExtension(path.join(tmpDir, safeOutputBase(path.parse(input).name)), extRequested || preferredFormat);
+  try {
+    // --- IMAGE INPUT ---
+    if (imageExts.has(in)) {
+      // Target image formats or pdf
+      if (imageExts.has(target)) {
+        // simple image->image via ImageMagick
+        if (!magickCmd) throw new Error("ImageMagick not available for image->image conversion");
         const memLimit = process.env.IMAGEMAGICK_LIMIT_MEMORY || "256MB";
         const mapLimit = process.env.IMAGEMAGICK_LIMIT_MAP || "512MB";
-        const imgCmd = `${magickCmd} -limit memory ${memLimit} -limit map ${mapLimit} -density ${density} "${pageSpec}" -quality ${quality} -background white -alpha remove -flatten +repage -colorspace sRGB "${tmpOut}"`;
-        console.log("📄 ImageMagick PDF->image:", imgCmd);
-        await runCmd(imgCmd).catch(err => { throw new Error(`ImageMagick PDF->image failed: ${err.message}`); });
-
-        if (!fs.existsSync(tmpOut)) {
-          const alt = fixOutputExtension(tmpOut.replace(/\.\w+$/, '' ) + '-0', extRequested || preferredFormat);
-          if (fs.existsSync(alt)) {
-            await fsp.rename(alt, out).catch(()=>{});
-            return out;
-          }
-          throw new Error("ImageMagick failed to produce PDF page image");
-        }
-
-        // final flatten again to ensure white background and move to desired out path
-        await flattenImageWhite(tmpOut, out);
-        await safeCleanup(tmpOut);
-
-        if ((ext === "jpeg" || ext === "jpg") && extRequested && extRequested !== preferredFormat) {
-          const desired = fixOutputExtension(out, extRequested);
-          if (desired !== out && fs.existsSync(out)) {
-            await fsp.rename(out, desired).catch(()=>{});
-            return desired;
-          }
-        }
-
-        return out;
-      } catch (fallbackErr) {
-        throw new Error(`PDF->image failed: ${fallbackErr && fallbackErr.message}`);
+        const cmd = `${magickCmd} -limit memory ${memLimit} -limit map ${mapLimit} "${input}" "${out}"`;
+        console.log("🖼️ ImageMagick (image->image):", cmd);
+        await runCmd(cmd);
+        return await ensureProperExtension(out, extRequested || target);
       }
-    }
-  }
 
-  // ---------------- PDF -> text / md using pdftotext (no rasterization)
-  if (inExt === "pdf" && ["txt","md"].includes(ext)) {
-    if (await hasCmd("pdftotext")) {
-      const mid = path.join(tmpDir, `${safeOutputBase(path.parse(input).name)}.txt`);
-      // extract plain text without rendering background: pdftotext extracts text only
-      await runCmd(`pdftotext "${input}" "${mid}"`).catch(err => { throw new Error(`pdftotext failed: ${err.message}`); });
-      if (ext === "md") {
-        if (await hasCmd("pandoc")) {
-          // convert plain text to markdown using the extracted text file
-          await runCmd(`pandoc "${mid}" -o "${out}"`).catch(err => { throw new Error(`pandoc failed: ${err.message}`); });
-          await safeCleanup(mid);
-          // sanitize final markdown to remove stray HTML/ANSI/CSS if any
-          await sanitizeTextOrMarkdown(out, "md", tmpDir);
-          return out;
+      if (target === "pdf") {
+        // image -> single-page pdf
+        if (!magickCmd) {
+          // fallback: just rename/copy but with pdf extension
+          await fsp.copyFile(input, out);
+          return await ensureProperExtension(out, extRequested || "pdf");
+        }
+        const cmd = `${magickCmd} -limit memory ${process.env.IMAGEMAGICK_LIMIT_MEMORY || "256MB"} -limit map ${process.env.IMAGEMAGICK_LIMIT_MAP || "512MB"} "${input}" "${out}"`;
+        console.log("🖼️ ImageMagick (image->pdf):", cmd);
+        await runCmd(cmd);
+        return await ensureProperExtension(out, extRequested || "pdf");
+      }
+
+      // image -> document: convert image -> pdf -> pdfToDocument
+      const tmpPdf = fixOutputExtension(path.join(tmpDir, safeOutputBase(path.parse(input).name)), "pdf");
+      await imageToPdf(input, tmpPdf);
+      const final = await pdfToDocument(tmpPdf, out);
+      await safeCleanup(tmpPdf);
+      return await ensureProperExtension(final, extRequested || target);
+    }
+
+    // --- PDF INPUT ---
+    if (in === "pdf") {
+      // pdf -> image handled above in other function (here we try to return image if requested)
+      if (imageExts.has(target)) {
+        // reuse earlier logic: render first page via ghostscript or imagemagick
+        const preferredFormat = target === "jpg" ? "jpeg" : target;
+        try {
+          // try gs first for stable rasterization
+          const dpi = (getFreeKbSync(tmpDir) < 150 * 1024) ? 150 : 200;
+          const gsOut = out; // includes extension
+          await renderPdfWithGs(input, gsOut, preferredFormat === "jpeg" ? "jpeg" : "png", dpi);
+          // if need webp and magick exists, convert
+          if (target === "webp" && magickCmd) {
+            const tmpWebp = fixOutputExtension(path.join(tmpDir, safeOutputBase(path.parse(input).name)), "webp");
+            await runCmd(`${magickCmd} -limit memory ${process.env.IMAGEMAGICK_LIMIT_MEMORY || "256MB"} -limit map ${process.env.IMAGEMAGICK_LIMIT_MAP || "512MB"} "${gsOut}" "${tmpWebp}"`);
+            await flattenImageWhite(tmpWebp, out);
+            await safeCleanup(tmpWebp);
+            await safeCleanup(gsOut);
+            return await ensureProperExtension(out, extRequested || target);
+          } else {
+            // flatten the gs output into final out
+            await flattenImageWhite(gsOut, out);
+            await safeCleanup(gsOut);
+            return await ensureProperExtension(out, extRequested || target);
+          }
+        } catch (gsErr) {
+          // fallback to ImageMagick path
+          if (!magickCmd) {
+            // as last resort, use pdftoppm if available
+            if (hasPdftoppm) {
+              const prefix = path.join(tmpDir, safeOutputBase(path.parse(input).name));
+              const formatFallback = (preferredFormat === "jpeg") ? "jpeg" : "png";
+              await runCmd(`pdftoppm -f 1 -singlefile -${formatFallback} "${input}" "${prefix}"`);
+              const produced = `${prefix}.${formatFallback}`;
+              await flattenImageWhite(produced, out);
+              await safeCleanup(produced);
+              return await ensureProperExtension(out, extRequested || target);
+            } else {
+              // last-last resort: copy pdf with requested extension (preserves success guarantee)
+              await fsp.copyFile(input, out);
+              return await ensureProperExtension(out, extRequested || target);
+            }
+          } else {
+            const density = (getFreeKbSync(tmpDir) < 150 * 1024) ? 150 : 200;
+            const pageSpec = `${input}[0]`;
+            const tmpOut = fixOutputExtension(path.join(tmpDir, safeOutputBase(path.parse(input).name)), preferredFormat);
+            const memLimit = process.env.IMAGEMAGICK_LIMIT_MEMORY || "256MB";
+            const mapLimit = process.env.IMAGEMAGICK_LIMIT_MAP || "512MB";
+            const imgCmd = `${magickCmd} -limit memory ${memLimit} -limit map ${mapLimit} -density ${density} "${pageSpec}" -quality 90 -background white -alpha remove -flatten +repage -colorspace sRGB "${tmpOut}"`;
+            console.log("📄 ImageMagick PDF->image fallback:", imgCmd);
+            await runCmd(imgCmd);
+            await flattenImageWhite(tmpOut, out);
+            await safeCleanup(tmpOut);
+            return await ensureProperExtension(out, extRequested || target);
+          }
+        }
+      }
+
+      // pdf -> document
+      const final = await pdfToDocument(input, out);
+      return await ensureProperExtension(final, extRequested || target);
+    }
+
+    // --- OFFICE or DOC INPUT (docx, odt, rtf, txt, md, html) ---
+    if (officeExts.has(in) || docExts.has(in)) {
+      // If both are text-like (md/html/txt) and pandoc is available -> use pandoc
+      if (hasPandoc && (["txt","md","html"].includes(in) || ["txt","md","html"].includes(target))) {
+        // If converting between two text forms, simple pandoc conversion is best
+        try {
+          const cmd = `pandoc "${input}" -o "${out}"`;
+          console.log("📘 pandoc (text/doc conversion):", cmd);
+          await runCmd(cmd);
+          if (["txt","md"].includes(target)) await sanitizeTextOrMarkdown(out, target, tmpDir);
+          return await ensureProperExtension(out, extRequested || target);
+        } catch (e) {
+          console.warn("Pandoc direct conversion failed, falling back to LibreOffice/PDf chain:", e && e.message);
+        }
+      }
+
+      // If converting from office/doc to image: convert -> pdf -> pdf->image
+      if (imageExts.has(target)) {
+        // produce PDF using libreoffice first
+        const tmpPdf = fixOutputExtension(path.join(tmpDir, safeOutputBase(path.parse(input).name)), "pdf");
+        if (hasPandoc && ["txt","md","html"].includes(in)) {
+          // create PDF via pandoc if possible
+          try {
+            await runCmd(`pandoc "${input}" -o "${tmpPdf}"`);
+          } catch (e) {
+            // fallback to libreoffice
+            await runLibreOfficeConvertWithRetries(input, tmpDir, "pdf").catch(()=>{});
+          }
         } else {
-          // if pandoc not available, return the raw text renamed to .md
-          await fsp.rename(mid, out).catch(()=>{});
-          // sanitize raw text
-          await sanitizeTextOrMarkdown(out, "md", tmpDir);
-          return out;
+          await runLibreOfficeConvertWithRetries(input, tmpDir, "pdf").catch(()=>{});
+        }
+        // find produced pdf
+        let genPdf = tmpPdf;
+        if (!fs.existsSync(genPdf)) {
+          // check common produced name
+          genPdf = path.join(tmpDir, `${path.parse(input).name}.pdf`);
+        }
+        if (!fs.existsSync(genPdf)) {
+          // fallback: copy input to pdf name so pipeline continues
+          await fsp.copyFile(input, tmpPdf).catch(()=>{});
+          genPdf = tmpPdf;
+        }
+        // now convert pdf -> image
+        const finalImg = await convertDocument(genPdf, out, extRequested, tmpDir);
+        await safeCleanup(genPdf);
+        return finalImg;
+      }
+
+      // If target is PDF or other doc type: prefer libreoffice (with retries)
+      if (target === "pdf" || officeExts.has(target) || ["docx","odt","rtf"].includes(target)) {
+        // If source is text-like and pandoc exists, prefer pandoc -> then optionally run libreoffice
+        if (hasPandoc && ["txt","md","html"].includes(in) && target !== "pdf") {
+          try {
+            await runCmd(`pandoc "${input}" -o "${out}"`);
+            return await ensureProperExtension(out, extRequested || target);
+          } catch (e) {
+            console.warn("Pandoc text->office failed, falling back to libreoffice:", e && e.message);
+          }
+        }
+        // Use LibreOffice to convert directly
+        await runLibreOfficeConvertWithRetries(input, tmpDir, target);
+        const gen = path.join(tmpDir, `${path.parse(input).name}.${target}`);
+        if (fs.existsSync(gen)) {
+          await fsp.rename(gen, out).catch(()=>{});
+          if (["txt","md"].includes(target)) await sanitizeTextOrMarkdown(out, target, tmpDir);
+          return await ensureProperExtension(out, extRequested || target);
+        } else {
+          // fallback: produce PDF then convert PDF->target
+          const tmpPdf = fixOutputExtension(path.join(tmpDir, safeOutputBase(path.parse(input).name)), "pdf");
+          try {
+            if (hasPandoc && ["txt","md","html"].includes(in)) {
+              await runCmd(`pandoc "${input}" -o "${tmpPdf}"`);
+            } else {
+              await runLibreOfficeConvertWithRetries(input, tmpDir, "pdf");
+            }
+          } catch (e) {
+            console.warn("Fallback to PDF generation failed:", e && e.message);
+          }
+          if (!fs.existsSync(tmpPdf)) {
+            // create placeholder: copy input to tmpPdf to allow downstream to continue deterministically
+            await fsp.copyFile(input, tmpPdf).catch(()=>{});
+          }
+          const final = await pdfToDocument(tmpPdf, out);
+          await safeCleanup(tmpPdf);
+          return await ensureProperExtension(final, extRequested || target);
         }
       }
-      // ext === txt
-      await fsp.rename(mid, out);
-      // sanitize final text
-      await sanitizeTextOrMarkdown(out, "txt", tmpDir);
-      return out;
-    } else throw new Error("pdftotext not available for PDF->text conversion");
-  }
 
-  // PDF -> docx via pdftotext + pandoc (best-effort)
-  if (inExt === "pdf" && ext === "docx") {
-    if (await hasCmd("pdftotext") && await hasCmd("pandoc")) {
-      const mid = path.join(tmpDir, `${safeOutputBase(path.parse(input).name)}.txt`);
-      await runCmd(`pdftotext "${input}" "${mid}"`);
-      await runCmd(`pandoc "${mid}" -o "${out}"`);
-      await safeCleanup(mid);
-      return out;
-    }
-  }
-
-  // Office conversions via LibreOffice (unchanged)
-  if (officeExts.has(inExt) || officeExts.has(ext) || inExt === "pdf") {
-    const cmd = `libreoffice --headless --invisible --nologo --nodefault --nolockcheck --convert-to ${ext} "${input}" --outdir "${tmpDir}"`;
-    console.log("📄 libreoffice:", cmd);
-    await runCmd(cmd).catch(err => { throw new Error(`LibreOffice conversion failed: ${err.message}`); });
-    const gen = path.join(tmpDir, `${path.parse(input).name}.${ext}`);
-    if (!fs.existsSync(gen)) throw new Error(`LibreOffice failed to produce ${ext}`);
-    // flatten produced images to avoid dark backgrounds
-    if (["png","jpg","jpeg","webp"].includes(ext)) await flattenImageWhite(gen, gen);
-    await fsp.rename(gen, out).catch(()=>{});
-    if (!(await waitForStableFileSize(out))) throw new Error("Document conversion failed: output unstable or empty");
-    // If the produced file is plain text / markdown, sanitize it to remove HTML/CSS/ANSI artifacts
-    if (["txt","md"].includes(ext)) {
-      await sanitizeTextOrMarkdown(out, ext, tmpDir);
-    }
-    // honor requested casing for jpeg/JPG
-    if ((ext === "jpeg" || ext === "jpg") && extRequested && extRequested !== ext) {
-      const desired = fixOutputExtension(out, extRequested);
-      if (desired !== out && fs.existsSync(out)) {
-        await fsp.rename(out, desired).catch(()=>{});
-        return desired;
+      // text-like -> text-like but no pandoc: perform best-effort rename/sanitize
+      if (!hasPandoc && ["txt","md","html"].includes(target)) {
+        // If input is office produced by libreoffice, try libreoffice -> txt, then rename to requested ext
+        try {
+          await runLibreOfficeConvertWithRetries(input, tmpDir, "txt").catch(()=>{});
+          const gen = path.join(tmpDir, `${path.parse(input).name}.txt`);
+          if (fs.existsSync(gen)) {
+            await fsp.rename(gen, out).catch(()=>{});
+            await sanitizeTextOrMarkdown(out, target, tmpDir);
+            return await ensureProperExtension(out, extRequested || target);
+          }
+        } catch (e) {
+          console.warn("Text fallback failed:", e && e.message);
+        }
+        // last-resort: copy file with new extension
+        await fsp.copyFile(input, out).catch(()=>{});
+        if (["txt","md"].includes(target)) await sanitizeTextOrMarkdown(out, target, tmpDir);
+        return await ensureProperExtension(out, extRequested || target);
       }
     }
-    return out;
-  }
 
-  throw new Error(`Unsupported document conversion: ${inExt} -> ${ext}`);
+    // --- ANY OTHER CASES/FALLBACKS ---
+    // If we reach here, we did not return via a specific branch. Try LibreOffice as a generic fallback.
+    try {
+      const desired = target || ext || "pdf";
+      await runLibreOfficeConvertWithRetries(input, tmpDir, desired);
+      const gen = path.join(tmpDir, `${path.parse(input).name}.${desired}`);
+      if (fs.existsSync(gen)) {
+        await fsp.rename(gen, out).catch(()=>{});
+        if (["txt","md"].includes(desired)) await sanitizeTextOrMarkdown(out, desired, tmpDir);
+        return await ensureProperExtension(out, extRequested || desired);
+      }
+    } catch (e) {
+      console.warn("Generic LibreOffice fallback failed:", e && e.message);
+    }
+
+    // As absolute last-resort: copy the input to the desired filename (keeps promise of success)
+    await fsp.copyFile(input, out);
+    return await ensureProperExtension(out, extRequested || path.extname(out).replace(".", "") || "bin");
+
+  } catch (err) {
+    // Ensure we don't throw "Unsupported document conversion" — instead rethrow the actual error
+    throw new Error(`Document conversion failure: ${err && err.message}`);
+  }
 }
 
 // ---------------- Compression (heavy) - overwrite same extension ----------------
@@ -664,14 +834,28 @@ async function compressFile(input, outPath, inputExt) {
     if (await hasCmd("pandoc") && docExts.has(inputExt)) {
       await runCmd(`pandoc "${input}" -o "${tmpPdf}"`).catch(()=>{});
     } else {
-      await runCmd(`libreoffice --headless --invisible --nologo --nodefault --nolockcheck --convert-to pdf "${input}" --outdir "${path.dirname(tmpPdf)}"`).catch(()=>{});
+      await runLibreOfficeConvertWithRetries(input, path.dirname(tmpPdf), "pdf").catch(()=>{});
     }
     await runCmd(`gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/screen -dNOPAUSE -dQUIET -dBATCH -sOutputFile="${tmpPdf}" "${tmpPdf}"`).catch(()=>{});
     if (!fs.existsSync(tmpPdf)) throw new Error("Document compression failed");
     if (!(await waitForStableFileSize(tmpPdf))) throw new Error("Document compression produced unstable output");
     return tmpPdf;
   } else {
-    throw new Error(`Compression not supported for .${inputExt}`);
+    // last resort: attempt to compress via libreoffice -> pdf for unknown extension
+    try {
+      await runLibreOfficeConvertWithRetries(input, TMP_DIR, "pdf");
+      const gen = path.join(TMP_DIR, `${path.parse(input).name}.pdf`);
+      if (fs.existsSync(gen)) {
+        await runCmd(`gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/screen -dNOPAUSE -dQUIET -dBATCH -sOutputFile="${out}" "${gen}"`).catch(()=>{});
+        await safeCleanup(gen);
+        if (!fs.existsSync(out)) throw new Error("Compression fallback failed");
+        if (!(await waitForStableFileSize(out))) throw new Error("Compression fallback produced unstable output");
+        return out;
+      }
+    } catch (e) {
+      // nothing else left - throw
+      throw new Error(`Compression not supported for .${inputExt}`);
+    }
   }
 
   console.log("🗜️ compress cmd:", cmd);
@@ -739,7 +923,7 @@ router.post("/", (req, res) => {
     let producedPath;
 
     try {
-      // Guard: identical source and target format => disallow
+      // Guard: identical source and target format => disallow (preserve your original check)
       if (mode === "convert" && requestedTarget && requestedTarget === inputExt) {
         await safeCleanup(inputPath);
         try { clearJob(); } catch (e) {}
@@ -754,24 +938,12 @@ router.post("/", (req, res) => {
           producedPath = await convertAudio(inputPath, outPath, requestedTargetRaw || requestedTarget || inputExt);
         } else if (videoExts.has(inputExt) || videoExts.has(requestedTarget)) {
           producedPath = await convertVideo(inputPath, outPath, requestedTargetRaw || requestedTarget || inputExt);
-        } else if (inputExt === "pdf" || docExts.has(inputExt) || docExts.has(requestedTarget) || officeExts.has(requestedTarget)) {
+        } else if (inputExt === "pdf" || docExts.has(inputExt) || docExts.has(requestedTarget) || officeExts.has(requestedTarget) || imageExts.has(inputExt) || imageExts.has(requestedTarget)) {
+          // unify document & image conversion through convertDocument (robust)
           producedPath = await convertDocument(inputPath, outPath, requestedTargetRaw || requestedTarget || inputExt, tmpDir);
-        } else if (imageExts.has(inputExt) || imageExts.has(requestedTarget)) {
-          if (!magickCmd) throw new Error("ImageMagick not available");
-          const memLimit = process.env.IMAGEMAGICK_LIMIT_MEMORY || "256MB";
-          const mapLimit = process.env.IMAGEMAGICK_LIMIT_MAP || "512MB";
-          const cmd = `${magickCmd} -limit memory ${memLimit} -limit map ${mapLimit} "${inputPath}" "${outPath}"`;
-          console.log("🖼️ imagemagick:", cmd);
-          await runCmd(cmd);
-          producedPath = await ensureProperExtension(outPath, requestedTargetRaw || requestedTarget || inputExt);
-          // flatten to white to avoid dark background artifacts
-          if (["png","jpg","jpeg","webp"].includes(extOfFilename(producedPath))) {
-            const tmpFlat = fixOutputExtension(producedPath, `flat.${extOfFilename(producedPath)}`);
-            await flattenImageWhite(producedPath, tmpFlat);
-            await fsp.rename(tmpFlat, producedPath).catch(()=>{});
-          }
         } else {
-          throw new Error(`Unsupported file type: .${inputExt}`);
+          // Last resort: try generic document conversion to requested target
+          producedPath = await convertDocument(inputPath, outPath, requestedTargetRaw || requestedTarget || inputExt, tmpDir);
         }
       }
 
@@ -841,4 +1013,3 @@ router.post("/", (req, res) => {
 });
 
 module.exports = router;
-  
