@@ -1,6 +1,6 @@
 # ------------------------------------------------------------
 # ⚡ EverToolbox Backend Dockerfile (Render-Optimized & Stable)
-# Full fix: ensures `magick` command available for image ops
+# Fixed: ensures ImageMagick works and avoids prewarm crash
 # ------------------------------------------------------------
 
 FROM node:20-bullseye
@@ -41,16 +41,6 @@ ENV FFMPEG_THREADS=4
 ENV FFMPEG_PRESET=ultrafast
 ENV FFMPEG_CRF=30
 RUN mkdir -p /root/.config/libreoffice/4/user
-
-# ------------------------------------------------------------
-# 🪄 Prewarm essential tools (optional)
-# ------------------------------------------------------------
-RUN ffmpeg -version && \
-    libreoffice --headless --version && \
-    magick -version && \
-    gs --version && \
-    pandoc -v && \
-    echo "✅ Prewarm complete."
 
 # ------------------------------------------------------------
 # 📦 Install Node.js dependencies
