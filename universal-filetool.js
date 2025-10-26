@@ -568,7 +568,7 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
 
   try {
     // --- IMAGE INPUT ---
-    if (imageExts.has(in)) {
+    if (imageExts.has(inputExt)) {
       // Target image formats or pdf
       if (imageExts.has(target)) {
         // simple image->image via ImageMagick
@@ -666,9 +666,9 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
     }
 
     // --- OFFICE or DOC INPUT (docx, odt, rtf, txt, md, html) ---
-    if (officeExts.has(in) || docExts.has(in)) {
+    if (officeExts.has(inputExt) || docExts.has(inputExt)) {
       // If both are text-like (md/html/txt) and pandoc is available -> use pandoc
-      if (hasPandoc && (["txt","md","html"].includes(in) || ["txt","md","html"].includes(target))) {
+      if (hasPandoc && (["txt","md","html"].includes(inputExt) || ["txt","md","html"].includes(target))) {
         // If converting between two text forms, simple pandoc conversion is best
         try {
           const cmd = `pandoc "${input}" -o "${out}"`;
@@ -685,7 +685,7 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
       if (imageExts.has(target)) {
         // produce PDF using libreoffice first
         const tmpPdf = fixOutputExtension(path.join(tmpDir, safeOutputBase(path.parse(input).name)), "pdf");
-        if (hasPandoc && ["txt","md","html"].includes(in)) {
+        if (hasPandoc && ["txt","md","html"].includes(inputExt)) {
           // create PDF via pandoc if possible
           try {
             await runCmd(`pandoc "${input}" -o "${tmpPdf}"`);
@@ -716,7 +716,7 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
       // If target is PDF or other doc type: prefer libreoffice (with retries)
       if (target === "pdf" || officeExts.has(target) || ["docx","odt","rtf"].includes(target)) {
         // If source is text-like and pandoc exists, prefer pandoc -> then optionally run libreoffice
-        if (hasPandoc && ["txt","md","html"].includes(in) && target !== "pdf") {
+        if (hasPandoc && ["txt","md","html"].includes(inputExt) && target !== "pdf") {
           try {
             await runCmd(`pandoc "${input}" -o "${out}"`);
             return await ensureProperExtension(out, extRequested || target);
@@ -735,7 +735,7 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
           // fallback: produce PDF then convert PDF->target
           const tmpPdf = fixOutputExtension(path.join(tmpDir, safeOutputBase(path.parse(input).name)), "pdf");
           try {
-            if (hasPandoc && ["txt","md","html"].includes(in)) {
+            if (hasPandoc && ["txt","md","html"].includes(inputExt)) {
               await runCmd(`pandoc "${input}" -o "${tmpPdf}"`);
             } else {
               await runLibreOfficeConvertWithRetries(input, tmpDir, "pdf");
