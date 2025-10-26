@@ -479,11 +479,11 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
 
   // Normalizing some synonyms
   const normExt = (s) => (s || "").toString().replace(/^\./, "").toLowerCase();
-  const in = normExt(inExt);
+  const inputExt  = normExt(inExt);
   const target = normExt(ext || path.extname(outPath).replace(".", "") || "");
 
   // If input is already same as target, simply copy and ensure extension
-  if (in === target) {
+  if (inputExt === target) {
     const cp = out;
     await fsp.copyFile(input, cp).catch(()=>{});
     return await ensureProperExtension(cp, extRequested || target);
@@ -603,7 +603,7 @@ async function convertDocument(input, outPath, targetExt, tmpDir) {
     }
 
     // --- PDF INPUT ---
-    if (in === "pdf") {
+    if (inputExt === "pdf") {
       // pdf -> image handled above in other function (here we try to return image if requested)
       if (imageExts.has(target)) {
         // reuse earlier logic: render first page via ghostscript or imagemagick
